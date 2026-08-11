@@ -5,10 +5,12 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_DIR = ROOT / "public"
+KST = ZoneInfo("Asia/Seoul")
 sys.path.insert(0, str(ROOT))
 
 from scan_volume_ichimoku import MARKET_CAP_KRW_THRESHOLD, ScanRun, scan
@@ -144,7 +146,7 @@ def diff_summary(regular: ScanRun, prepost: ScanRun) -> str:
 
 
 def build_page(regular: ScanRun, prepost: ScanRun, regular_links: dict[str, str], prepost_links: dict[str, str]) -> None:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     html_text = f"""<!doctype html>
 <html lang="ko">
 <head>

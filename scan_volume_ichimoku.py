@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import matplotlib
 
@@ -38,6 +39,7 @@ TIMEFRAMES = [
 ]
 
 REQUIRED_COLS = ["Tenkan", "Kijun", "MA20", "SpanA", "SpanB", "SpanA_raw", "SpanB_raw", "Close_26_Ago"]
+KST = ZoneInfo("Asia/Seoul")
 MARKET_CAP_KRW_THRESHOLD = 2_000_000_000_000
 USD_KRW_FALLBACK = 1_350.0
 DEFAULT_SCREEN_COUNT = 250
@@ -442,7 +444,7 @@ def write_report(
     exclude_leveraged_etfs: bool,
 ) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     lines = [
         "# Volume Top 50 Ichimoku Multi-Timeframe Scan",
         "",
@@ -584,7 +586,7 @@ def scan(
             results.append(result)
 
     selected = select_candidates(results, chart_limit)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    stamp = datetime.now(KST).strftime("%Y%m%d_%H%M")
     session_tag = "prepost" if prepost else "regular"
     report_path = OUTPUT_DIR / f"volume_ichimoku_scan_{stamp}_{session_tag}.md"
     write_report(
