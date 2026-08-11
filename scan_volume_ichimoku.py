@@ -441,6 +441,7 @@ def write_report(
     min_market_cap_usd: float,
     exclude_leveraged_etfs: bool,
 ) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "# Volume Top 50 Ichimoku Multi-Timeframe Scan",
