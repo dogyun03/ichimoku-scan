@@ -3,16 +3,25 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import json
+import re
 import sys
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:  # pragma: no cover - GitHub Actions installs this dependency.
+    BeautifulSoup = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +30,7 @@ PUBLIC_ANALYSIS_DIR = ROOT / "public" / "analysis"
 PUBLIC_DAILY_DIR = ROOT / "public" / "daily"
 PORTFOLIO_PATH = ROOT / "portfolio.csv"
 KST = ZoneInfo("Asia/Seoul")
+NAVER_RESEARCH_URL = "https://finance.naver.com/research/"
 
 sys.path.insert(0, str(ROOT))
 
@@ -47,6 +57,10 @@ def e(value: object) -> str:
     return html.escape(str(value))
 
 
+def clean_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
 def fmt_number(value: object) -> str:
     number = number_or_none(value)
     if number is None:
@@ -70,6 +84,15 @@ def fmt_pct(value: object) -> str:
     return f"{number:+.2f}%"
 
 
+def fmt_fin_pct(value: object) -> str:
+    number = number_or_none(value)
+    if number is None:
+        return "n/a"
+    if abs(number) <= 2:
+        number *= 100
+    return f"{number:+.1f}%"
+
+
 def fmt_ratio(value: object) -> str:
     number = number_or_none(value)
     if number is None:
@@ -77,32 +100,75 @@ def fmt_ratio(value: object) -> str:
     return f"{number:.1f}"
 
 
+def fmt_money(value: object, currency: str = "USD") -> str:
+    number = number_or_none(value)
+    if number is None:
+        return "n/a"
+    sign = "-" if number < 0 else ""
+    number = abs(number)
+    if number >= 1_000_000_000_000:
+        text = f"{number / 1_000_000_000_000:.2f}T"
+    elif number >= 1_000_000_000:
+        text = f"{number / 1_000_000_000:.2f}B"
+    elif number >= 1_000_000:
+        text = f"{number / 1_000_000:.1f}M"
+    else:
+        text = f"{number:,.0f}"
+    return f"{sign}{currency} {text}"
+
+
 def fmt_date(value: object) -> str:
     if value is None:
         return "n/a"
     if isinstance(value, list) and value:
         return fmt_date(value[0])
+    if hasattr(value, "to_pydatetime"):
+        return fmt_date(value.to_pydatetime())
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=KST)
         return value.astimezone(KST).strftime("%Y-%m-%d")
     if isinstance(value, date):
         return value.strftime("%Y-%m-%d")
-    return str(value)
+    return clean_text(value) or "n/a"
+
+
+def fmt_datetime(value: object) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=KST)
+        return value.astimezone(KST).strftime("%m-%d %H:%M")
+    return clean_text(value) or "n/a"
+
+
+def date_from_timestamp(value: object) -> str | None:
+    number = number_or_none(value)
+    if number is None:
+        return None
+    try:
+        return datetime.fromtimestamp(number, tz=KST).strftime("%Y-%m-%d")
+    except Exception:
+        return None
 
 
 def source_links(symbol: str) -> dict[str, str]:
     encoded = urllib.parse.quote(symbol)
-    query = urllib.parse.quote(f"{symbol} 증권사 리포트")
+    report_query = urllib.parse.quote(f"{symbol} 증권사 리포트")
+    news_query = urllib.parse.quote(f"{symbol} 핵심 뉴스")
     stockplus_query = urllib.parse.quote(symbol)
     naver_query = urllib.parse.quote(f"{symbol} 주식")
     return {
-        "tradingview": f"https://www.tradingview.com/chart/?symbol={encoded}",
         "yahoo": f"https://finance.yahoo.com/quote/{encoded}/",
         "yahoo_stats": f"https://finance.yahoo.com/quote/{encoded}/key-statistics/",
         "yahoo_analysis": f"https://finance.yahoo.com/quote/{encoded}/analysis/",
         "investing": f"https://www.investing.com/search/?q={encoded}",
         "naver": f"https://search.naver.com/search.naver?query={naver_query}",
         "stockplus": f"https://stockplus.com/search?q={stockplus_query}",
-        "reports": f"https://www.google.com/search?q={query}",
+        "news": f"https://www.google.com/search?q={news_query}",
+        "reports": f"https://www.google.com/search?q={report_query}",
+        "naver_research": NAVER_RESEARCH_URL,
     }
 
 
@@ -128,10 +194,54 @@ def read_portfolio(path: Path = PORTFOLIO_PATH) -> dict[str, PortfolioPosition]:
     return positions
 
 
+def first_metric(statement: object, names: list[str]) -> float | None:
+    if statement is None or getattr(statement, "empty", True):
+        return None
+    try:
+        frame = statement
+        labels = list(frame.index)
+        columns = list(frame.columns)
+    except Exception:
+        return None
+
+    label_lookup = {clean_text(label).lower(): label for label in labels}
+    for name in names:
+        label = label_lookup.get(name.lower())
+        if label is None:
+            for candidate in labels:
+                if name.lower() in clean_text(candidate).lower():
+                    label = candidate
+                    break
+        if label is None:
+            continue
+        for column in columns:
+            try:
+                value = frame.loc[label, column]
+            except Exception:
+                continue
+            number = number_or_none(value)
+            if number is not None:
+                return number
+    return None
+
+
+def latest_statement_period(statement: object) -> str:
+    if statement is None or getattr(statement, "empty", True):
+        return "n/a"
+    try:
+        columns = list(statement.columns)
+    except Exception:
+        return "n/a"
+    if not columns:
+        return "n/a"
+    return fmt_date(columns[0])
+
+
 def fetch_yahoo_extras(symbol: str) -> dict[str, object]:
     ticker = yf.Ticker(symbol)
     info: dict[str, object] = {}
     calendar: dict[str, object] = {}
+    statement: object | None = None
 
     try:
         raw_info = ticker.get_info()
@@ -147,13 +257,24 @@ def fetch_yahoo_extras(symbol: str) -> dict[str, object]:
     except Exception:
         calendar = {}
 
+    try:
+        statement = ticker.quarterly_income_stmt
+    except Exception:
+        statement = None
+
     price = info.get("currentPrice") or info.get("regularMarketPrice")
     low = number_or_none(info.get("fiftyTwoWeekLow"))
     high = number_or_none(info.get("fiftyTwoWeekHigh"))
-    position_52w = "n/a"
     price_number = number_or_none(price)
+    position_52w = "n/a"
     if price_number is not None and low is not None and high is not None and high > low:
         position_52w = f"{((price_number - low) / (high - low)) * 100:.0f}%"
+
+    next_earnings = (
+        calendar.get("Earnings Date")
+        or date_from_timestamp(info.get("earningsTimestampStart"))
+        or date_from_timestamp(info.get("earningsTimestamp"))
+    )
 
     return {
         "sector": info.get("sector") or "n/a",
@@ -165,15 +286,83 @@ def fetch_yahoo_extras(symbol: str) -> dict[str, object]:
         "revenue_growth": info.get("revenueGrowth"),
         "target_mean_price": info.get("targetMeanPrice"),
         "recommendation": info.get("recommendationKey") or "n/a",
-        "next_earnings": calendar.get("Earnings Date"),
+        "next_earnings": next_earnings,
         "eps_average": calendar.get("Earnings Average"),
         "revenue_average": calendar.get("Revenue Average"),
         "ex_dividend": calendar.get("Ex-Dividend Date"),
         "position_52w": position_52w,
+        "latest_quarter": latest_statement_period(statement),
+        "latest_revenue": first_metric(statement, ["Total Revenue", "Operating Revenue"]),
+        "latest_net_income": first_metric(
+            statement,
+            [
+                "Net Income",
+                "Net Income Common Stockholders",
+                "Net Income From Continuing Operation Net Minority Interest",
+            ],
+        ),
+        "latest_eps": first_metric(statement, ["Diluted EPS", "Basic EPS"]),
     }
 
 
-def fetch_news(symbol: str, limit: int) -> list[dict[str, str]]:
+def parse_news_datetime(value: str) -> datetime | None:
+    try:
+        parsed = parsedate_to_datetime(value)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=KST)
+    return parsed.astimezone(KST)
+
+
+def news_theme(title: str) -> str:
+    text = title.lower()
+    if any(word in text for word in ("earnings", "revenue", "profit", "guidance", "sales")):
+        return "실적/가이던스"
+    if any(word in text for word in ("analyst", "rating", "target", "upgrade", "downgrade")):
+        return "애널리스트"
+    if any(word in text for word in ("ai", "chip", "semiconductor", "data center", "gpu")):
+        return "AI·반도체"
+    if any(word in text for word in ("ev", "battery", "energy", "oil", "gas", "solar")):
+        return "전기차·에너지"
+    if any(word in text for word in ("bitcoin", "crypto", "rate", "fed", "yield", "inflation")):
+        return "매크로·크립토"
+    if any(word in text for word in ("lawsuit", "probe", "regulator", "tariff", "ban")):
+        return "규제·소송"
+    return "기업 이슈"
+
+
+def news_summary(symbol: str, title: str) -> str:
+    theme = news_theme(title)
+    if theme == "실적/가이던스":
+        return f"{symbol}의 실적 기대치나 가이던스 변화가 주가 반응의 중심입니다."
+    if theme == "애널리스트":
+        return f"{symbol}에 대한 목표가·투자의견 변화가 단기 수급을 흔들 수 있습니다."
+    if theme == "AI·반도체":
+        return f"{symbol} 관련 AI·반도체 수요와 밸류체인 흐름을 같이 봐야 합니다."
+    if theme == "전기차·에너지":
+        return f"{symbol}의 수요, 원가, 정책 변수가 같이 움직이는 뉴스입니다."
+    if theme == "매크로·크립토":
+        return f"{symbol} 자체 이슈보다 금리·유동성·위험선호 변화와 연결해 봅니다."
+    if theme == "규제·소송":
+        return f"{symbol}의 밸류에이션보다 이벤트 리스크 확인이 먼저입니다."
+    return f"{symbol}의 개별 재료가 기존 추세를 강화하는지 확인할 뉴스입니다."
+
+
+def news_angle(title: str) -> str:
+    theme = news_theme(title)
+    if theme in {"실적/가이던스", "애널리스트"}:
+        return "발표 직후 갭과 거래량이 유지되는지 확인"
+    if theme in {"AI·반도체", "전기차·에너지"}:
+        return "같은 섹터 동반 강도와 대장주 흐름 확인"
+    if theme == "매크로·크립토":
+        return "지수·금리·달러 움직임과 같이 비교"
+    if theme == "규제·소송":
+        return "첫 반응보다 추가 보도와 변동성 확대 주의"
+    return "뉴스 이후 전고·전저 돌파 여부 확인"
+
+
+def fetch_news(symbol: str, limit: int) -> list[dict[str, object]]:
     url = (
         "https://feeds.finance.yahoo.com/rss/2.0/headline?"
         f"s={urllib.parse.quote(symbol)}&region=US&lang=en-US"
@@ -186,16 +375,197 @@ def fetch_news(symbol: str, limit: int) -> list[dict[str, str]]:
     except Exception:
         return []
 
-    items: list[dict[str, str]] = []
+    items: list[dict[str, object]] = []
     for item in root.findall("./channel/item"):
-        title = item.findtext("title") or ""
+        title = clean_text(item.findtext("title") or "")
         link = item.findtext("link") or source_links(symbol)["yahoo"]
-        pub_date = item.findtext("pubDate") or ""
+        published = item.findtext("pubDate") or ""
+        published_dt = parse_news_datetime(published)
         if title:
-            items.append({"title": title, "link": link, "published": pub_date})
+            items.append(
+                {
+                    "symbol": symbol,
+                    "title": title,
+                    "link": link,
+                    "published": published,
+                    "published_dt": published_dt,
+                    "theme": news_theme(title),
+                    "summary": news_summary(symbol, title),
+                    "angle": news_angle(title),
+                }
+            )
         if len(items) >= limit:
             break
     return items
+
+
+def http_soup(url: str, *, encoding: str = "utf-8", timeout: int = 15):
+    if BeautifulSoup is None:
+        return None
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read()
+    return BeautifulSoup(data, "html.parser", from_encoding=encoding)
+
+
+def report_theme(category: str, title: str) -> str:
+    text = f"{category} {title}".lower()
+    if re.search(r"\b[1-4]q\b|실적|review|preview|earnings|컨센서스", text):
+        return "실적"
+    if any(word in text for word in ("반도체", "ai", "hbm", "메모리", "chip")):
+        return "AI·반도체"
+    if any(word in text for word in ("자동차", "배터리", "전기차", "2차전지", "에너지")):
+        return "자동차·에너지"
+    if any(word in text for word in ("은행", "증권", "보험", "금융")):
+        return "금융"
+    if any(word in text for word in ("주간", "weekly", "전략", "시황")):
+        return "시장전략"
+    if any(word in text for word in ("산업", "업종", "sector")):
+        return "업종"
+    return category or "리서치"
+
+
+def report_summary(report: dict[str, str]) -> str:
+    theme = report_theme(report.get("category", ""), report.get("title", ""))
+    opinion = report.get("opinion") or ""
+    target_price = report.get("target_price") or ""
+    parts: list[str] = []
+    if theme == "실적":
+        parts.append("실적과 컨센서스 차이를 확인하는 리포트입니다.")
+    elif theme == "AI·반도체":
+        parts.append("AI·반도체 수요와 밸류체인 영향을 보는 리포트입니다.")
+    elif theme == "자동차·에너지":
+        parts.append("수요, 원가, 정책 변수가 함께 작용하는 리포트입니다.")
+    elif theme == "금융":
+        parts.append("금리, 마진, 건전성 변수를 중심으로 보는 리포트입니다.")
+    elif theme == "시장전략":
+        parts.append("지수와 업종 흐름을 함께 정리하는 전략 리포트입니다.")
+    elif theme == "업종":
+        parts.append("개별 종목보다 업종 사이클을 먼저 보는 리포트입니다.")
+    else:
+        parts.append("제목 기준 핵심 이슈를 점검하는 리포트입니다.")
+    if opinion:
+        parts.append(f"투자의견은 {opinion}입니다.")
+    if target_price:
+        parts.append(f"목표가는 {target_price}입니다.")
+    return " ".join(parts)
+
+
+def report_analysis(report: dict[str, str]) -> str:
+    text = f"{report.get('title', '')} {report.get('opinion', '')}".lower()
+    positive = ("호실적", "상회", "개선", "성장", "모멘텀", "회복", "레벨업", "buy", "매수")
+    negative = ("부진", "하회", "둔화", "적자", "우려", "리스크", "하향", "중립", "sell", "hold")
+    if any(word in text for word in positive):
+        return "톤은 긍정 쪽입니다. 차트 신호와 거래량이 같은 방향으로 붙는지 확인합니다."
+    if any(word in text for word in negative):
+        return "톤은 방어적입니다. 반등보다 매물 부담과 실적 리스크를 먼저 봅니다."
+    return "톤은 중립 점검에 가깝습니다. 같은 업종 흐름과 수급 동반 여부를 확인합니다."
+
+
+def extract_report_detail(url: str) -> dict[str, str]:
+    try:
+        soup = http_soup(url, timeout=10)
+    except Exception:
+        return {}
+    if soup is None:
+        return {}
+
+    tokens = [clean_text(token) for token in soup.get_text("|", strip=True).split("|")]
+    detail: dict[str, str] = {}
+    for idx, token in enumerate(tokens):
+        if token == "목표가" and idx + 1 < len(tokens):
+            detail["target_price"] = tokens[idx + 1]
+        elif token == "투자의견" and idx + 1 < len(tokens):
+            detail["opinion"] = tokens[idx + 1]
+    return detail
+
+
+def first_report_link(row, needle: str) -> str:
+    for anchor in row.find_all("a", href=True):
+        href = str(anchor["href"])
+        if needle in href:
+            return urljoin(NAVER_RESEARCH_URL, href)
+    return ""
+
+
+def first_pdf_link(row) -> str:
+    for anchor in row.find_all("a", href=True):
+        href = str(anchor["href"])
+        if ".pdf" in href.lower() or "stock-research" in href.lower():
+            return urljoin(NAVER_RESEARCH_URL, href)
+    return ""
+
+
+def fetch_naver_research_reports(limit: int = 36, detail_limit: int = 12) -> list[dict[str, str]]:
+    try:
+        soup = http_soup(NAVER_RESEARCH_URL)
+    except Exception:
+        return []
+    if soup is None:
+        return []
+
+    reports: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    category_fallback = ["종목분석", "산업분석", "시황정보", "투자정보"]
+    tables = soup.find_all("table", class_="type_3")
+    detail_count = 0
+
+    for table_index, table in enumerate(tables):
+        category = category_fallback[min(table_index, len(category_fallback) - 1)]
+        heading = table.find_previous(["h3", "h4", "strong"])
+        heading_text = clean_text(heading.get_text(" ", strip=True)) if heading else ""
+        for known in category_fallback:
+            if known in heading_text:
+                category = known
+                break
+
+        for row in table.find_all("tr"):
+            cells = [clean_text(cell.get_text(" ", strip=True)) for cell in row.find_all("td")]
+            if len(cells) < 3 or not any(cells):
+                continue
+            if any(cell in {"제목", "종목명", "날짜"} for cell in cells):
+                continue
+
+            if category in {"종목분석", "산업분석"} and len(cells) >= 5:
+                subject = cells[0]
+                title = cells[1]
+                broker = cells[2]
+                report_date = cells[-1]
+            else:
+                subject = category
+                title = cells[0]
+                broker = cells[1] if len(cells) > 1 else ""
+                report_date = cells[-1]
+
+            if not title or not report_date:
+                continue
+
+            read_url = first_report_link(row, "_read.naver")
+            pdf_url = first_pdf_link(row)
+            key = (title, report_date)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            report = {
+                "category": category,
+                "subject": subject,
+                "title": title,
+                "broker": broker,
+                "date": report_date,
+                "read_url": read_url,
+                "pdf_url": pdf_url,
+                "theme": report_theme(category, title),
+            }
+            if read_url and detail_count < detail_limit:
+                report.update(extract_report_detail(read_url))
+                detail_count += 1
+            report["summary"] = report_summary(report)
+            report["analysis"] = report_analysis(report)
+            reports.append(report)
+            if len(reports) >= limit:
+                return reports
+    return reports
 
 
 def load_universe(count: int, screen_count: int) -> tuple[list[dict[str, object]], int, dict[str, int], float, float]:
@@ -228,6 +598,48 @@ def enrich_records(
     return enriched
 
 
+def portfolio_lookup_data(records: list[dict[str, object]], portfolio: dict[str, PortfolioPosition]) -> dict[str, dict[str, object]]:
+    by_symbol = {str(record["symbol"]).upper(): record for record in records}
+    data: dict[str, dict[str, object]] = {}
+    for symbol, position in portfolio.items():
+        record = by_symbol.get(symbol)
+        price = number_or_none(record.get("price")) if record else None
+        pnl_pct = ((price - position.average_price) / position.average_price) * 100 if price is not None else None
+        value = price * position.quantity if price is not None else None
+        data[symbol] = {
+            "symbol": symbol,
+            "average_price": fmt_price(position.average_price),
+            "quantity": fmt_number(position.quantity),
+            "currency": position.currency,
+            "price": fmt_price(price),
+            "pnl_pct": fmt_pct(pnl_pct),
+            "value": fmt_price(value),
+        }
+    return data
+
+
+def scanned_lookup_data(records: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    data: dict[str, dict[str, object]] = {}
+    for record in records:
+        symbol = str(record["symbol"]).upper()
+        extras = dict(record.get("extras") or {})
+        data[symbol] = {
+            "symbol": symbol,
+            "name": clean_text(record.get("name") or record.get("long_name") or symbol),
+            "type": clean_text(record.get("asset_class") or record.get("quote_type") or "n/a"),
+            "price": fmt_price(record.get("price")),
+            "change_pct": fmt_pct(record.get("change_pct")),
+            "volume": fmt_number(record.get("volume")),
+            "market_cap": market_cap_text(record.get("market_cap")),
+            "next_earnings": fmt_date(extras.get("next_earnings")),
+            "latest_quarter": fmt_date(extras.get("latest_quarter")),
+            "latest_revenue": fmt_money(extras.get("latest_revenue")),
+            "latest_net_income": fmt_money(extras.get("latest_net_income")),
+            "latest_eps": fmt_ratio(extras.get("latest_eps")),
+        }
+    return data
+
+
 def portfolio_rows(records: list[dict[str, object]], portfolio: dict[str, PortfolioPosition]) -> str:
     rows: list[str] = []
     by_symbol = {str(record["symbol"]).upper(): record for record in records}
@@ -236,22 +648,21 @@ def portfolio_rows(records: list[dict[str, object]], portfolio: dict[str, Portfo
         price = number_or_none(record.get("price")) if record else None
         value = price * position.quantity if price is not None else None
         pnl_pct = ((price - position.average_price) / position.average_price) * 100 if price is not None else None
-        links = source_links(symbol)
         rows.append(
             "<tr>"
             f"<td>{e(symbol)}</td>"
             f"<td>{fmt_price(position.average_price)}</td>"
+            f"<td>{fmt_number(position.quantity)}</td>"
             f"<td>{fmt_price(price)}</td>"
             f"<td>{fmt_pct(pnl_pct)}</td>"
             f"<td>{fmt_price(value)}</td>"
-            f'<td><a href="{e(links["yahoo"])}">시세</a> '
-            f'<a href="{e(links["reports"])}">리포트</a></td>'
             "</tr>"
         )
     if not rows:
         return (
             '<tr><td colspan="6">평단가를 보려면 저장소 루트에 '
-            '<code>portfolio.csv</code>를 만들고 symbol, average_price, quantity, currency를 입력하세요.</td></tr>'
+            '<code>portfolio.csv</code>를 만들고 symbol, average_price, quantity, currency를 입력하세요. '
+            "공개 GitHub Pages에는 개인 평단가가 자동으로 올라가지 않습니다.</td></tr>"
         )
     return "".join(rows)
 
@@ -271,69 +682,77 @@ def stats_rows(records: list[dict[str, object]]) -> str:
             f"<td>{fmt_number(record.get('volume'))}</td>"
             f"<td>{market_cap_text(record.get('market_cap'))}</td>"
             f"<td>{fmt_date(extras.get('next_earnings'))}</td>"
-            f"<td>{fmt_ratio(extras.get('eps_average'))}</td>"
+            f"<td>{fmt_date(extras.get('latest_quarter'))}</td>"
+            f"<td>{fmt_money(extras.get('latest_revenue'))}</td>"
+            f"<td>{fmt_money(extras.get('latest_net_income'))}</td>"
+            f"<td>{fmt_ratio(extras.get('latest_eps'))}</td>"
+            f"<td>{fmt_fin_pct(extras.get('revenue_growth'))}</td>"
+            f"<td>{fmt_fin_pct(extras.get('profit_margin'))}</td>"
             f"<td>{fmt_ratio(extras.get('trailing_pe'))}/{fmt_ratio(extras.get('forward_pe'))}</td>"
             f"<td>{e(extras.get('position_52w', 'n/a'))}</td>"
-            f'<td><a href="{e(links["investing"])}">Investing</a> '
-            f'<a href="{e(links["yahoo_stats"])}">Stats</a></td>'
+            f'<td><a href="{e(links["investing"])}">실적</a> '
+            f'<a href="{e(links["yahoo_stats"])}">통계</a></td>'
             "</tr>"
         )
     return "".join(rows)
+
+
+def collect_news(records: list[dict[str, object]], limit: int = 24) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for record in records:
+        for item in list(record.get("news") or []):
+            items.append(dict(item))
+    items.sort(key=lambda item: item.get("published_dt") or datetime.min.replace(tzinfo=KST), reverse=True)
+    return items[:limit]
 
 
 def news_rows(records: list[dict[str, object]]) -> str:
     rows: list[str] = []
-    for record in records:
-        symbol = str(record["symbol"])
-        links = dict(record.get("links") or source_links(symbol))
-        news = list(record.get("news") or [])
-        if not news:
-            rows.append(
-                "<tr>"
-                f"<td>{e(symbol)}</td>"
-                f'<td><a href="{e(links["yahoo"])}">뉴스 보기</a></td>'
-                "<td>자동 수집 없음</td>"
-                "</tr>"
-            )
-            continue
-        for item in news:
-            rows.append(
-                "<tr>"
-                f"<td>{e(symbol)}</td>"
-                f'<td><a href="{e(item["link"])}">{e(item["title"])}</a></td>'
-                f"<td>{e(item.get('published', ''))}</td>"
-                "</tr>"
-            )
+    for item in collect_news(records):
+        rows.append(
+            "<tr>"
+            f"<td>{e(item.get('symbol', ''))}</td>"
+            f"<td>{e(item.get('theme', '기업 이슈'))}</td>"
+            f'<td><a href="{e(item.get("link", ""))}">{e(item.get("title", ""))}</a></td>'
+            f"<td>{e(item.get('summary', ''))}</td>"
+            f"<td>{e(item.get('angle', ''))}</td>"
+            f"<td>{fmt_datetime(item.get('published_dt'))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return '<tr><td colspan="6">자동 수집된 핵심 뉴스가 없습니다. 종목별 뉴스 링크에서 직접 확인하세요.</td></tr>'
     return "".join(rows)
 
 
-def link_rows(records: list[dict[str, object]]) -> str:
+def report_rows(reports: list[dict[str, str]]) -> str:
     rows: list[str] = []
-    for record in records:
-        symbol = str(record["symbol"])
-        links = dict(record.get("links") or source_links(symbol))
-        is_korean_code = symbol.isdigit() and len(symbol) == 6
-        naver_flow = (
-            f"https://finance.naver.com/item/frgn.naver?code={symbol}"
-            if is_korean_code
-            else links["naver"]
-        )
-        flow_label = "네이버 수급" if is_korean_code else "네이버 검색"
+    for report in reports:
+        title = e(report.get("title", ""))
+        read_url = report.get("read_url") or ""
+        pdf_url = report.get("pdf_url") or ""
+        title_cell = f'<a href="{e(read_url)}">{title}</a>' if read_url else title
+        pdf_cell = f'<a href="{e(pdf_url)}">PDF</a>' if pdf_url else ""
         rows.append(
             "<tr>"
-            f"<td>{e(symbol)}</td>"
-            f'<td><a href="{e(naver_flow)}">{flow_label}</a></td>'
-            f'<td><a href="{e(links["stockplus"])}">증권플러스</a></td>'
-            f'<td><a href="{e(links["reports"])}">리포트 검색</a></td>'
-            f'<td><a href="{e(links["yahoo_analysis"])}">애널리스트</a></td>'
+            f"<td>{e(report.get('date', ''))}</td>"
+            f"<td>{e(report.get('category', ''))}</td>"
+            f"<td>{e(report.get('subject', ''))}</td>"
+            f"<td>{title_cell}</td>"
+            f"<td>{e(report.get('broker', ''))}</td>"
+            f"<td>{e(report.get('theme', ''))}</td>"
+            f"<td>{e(report.get('summary', ''))}</td>"
+            f"<td>{e(report.get('analysis', ''))}</td>"
+            f"<td>{pdf_cell}</td>"
             "</tr>"
         )
+    if not rows:
+        return '<tr><td colspan="9">오늘 수집된 네이버 리서치 목록이 없습니다.</td></tr>'
     return "".join(rows)
 
 
 def source_launcher(records: list[dict[str, object]]) -> str:
     buttons = []
-    for record in records[:16]:
+    for record in records[:18]:
         symbol = str(record["symbol"])
         buttons.append(f'<button type="button" data-symbol="{e(symbol)}">{e(symbol)}</button>')
     return "".join(buttons)
@@ -347,6 +766,7 @@ def write_markdown(
     usd_krw: float,
     min_market_cap_usd: float,
     portfolio: dict[str, PortfolioPosition],
+    research_reports: list[dict[str, str]],
     stamp: str,
 ) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -356,7 +776,7 @@ def write_markdown(
         "# Stock Analysis Briefing",
         "",
         f"- Update: `{now}`",
-        "- Scope: source briefing separated from Ichimoku scan",
+        "- Scope: chart analysis separated from source briefing",
         "- Universe source: Yahoo Finance `most_actives` + `most_actives_etfs`",
         f"- Raw symbols fetched: `{raw_count}`",
         f"- Filtered universe analyzed: `{len(records)}`",
@@ -364,23 +784,34 @@ def write_markdown(
         "- ETF rule: normal ETFs included; leveraged/inverse ETFs excluded",
         f"- Excluded summary: `{excluded}`",
         "",
-        "## Portfolio average price",
+        "## Average price lookup",
         "",
     ]
     if portfolio:
-        lines.append("| Symbol | Avg | Price | P/L | Value |")
-        lines.append("|---|---:|---:|---:|---:|")
+        lines.append("| Symbol | Avg | Qty | Price | P/L | Value |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
         by_symbol = {str(record["symbol"]).upper(): record for record in records}
         for symbol, position in portfolio.items():
             record = by_symbol.get(symbol)
             price = number_or_none(record.get("price")) if record else None
             pnl_pct = ((price - position.average_price) / position.average_price) * 100 if price is not None else None
             value = price * position.quantity if price is not None else None
-            lines.append(f"| {symbol} | {fmt_price(position.average_price)} | {fmt_price(price)} | {fmt_pct(pnl_pct)} | {fmt_price(value)} |")
+            lines.append(
+                f"| {symbol} | {fmt_price(position.average_price)} | {fmt_number(position.quantity)} | "
+                f"{fmt_price(price)} | {fmt_pct(pnl_pct)} | {fmt_price(value)} |"
+            )
     else:
         lines.append("No `portfolio.csv` found. Create one from `portfolio.example.csv` to show average price and P/L.")
 
-    lines.extend(["", "## Earnings and key stats", "", "| Symbol | Type | Price | Chg | Vol | MCap | Earnings | EPS Avg | PE T/F | 52w Pos |", "|---|---|---:|---:|---:|---:|---|---:|---:|---:|"])
+    lines.extend(
+        [
+            "",
+            "## Earnings dates, results, and key stats",
+            "",
+            "| Symbol | Type | Price | Chg | Vol | MCap | Next Earnings | Latest Q | Revenue | Net Income | EPS | Revenue Growth | Margin | PE T/F | 52w Pos |",
+            "|---|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for record in records:
         symbol = str(record["symbol"])
         extras = dict(record.get("extras") or {})
@@ -388,17 +819,42 @@ def write_markdown(
             f"| {symbol} | {record.get('asset_class', record.get('quote_type', 'n/a'))} | "
             f"{fmt_price(record.get('price'))} | {fmt_pct(record.get('change_pct'))} | {fmt_number(record.get('volume'))} | "
             f"{market_cap_text(record.get('market_cap'))} | {fmt_date(extras.get('next_earnings'))} | "
-            f"{fmt_ratio(extras.get('eps_average'))} | {fmt_ratio(extras.get('trailing_pe'))}/{fmt_ratio(extras.get('forward_pe'))} | "
-            f"{extras.get('position_52w', 'n/a')} |"
+            f"{fmt_date(extras.get('latest_quarter'))} | {fmt_money(extras.get('latest_revenue'))} | "
+            f"{fmt_money(extras.get('latest_net_income'))} | {fmt_ratio(extras.get('latest_eps'))} | "
+            f"{fmt_fin_pct(extras.get('revenue_growth'))} | {fmt_fin_pct(extras.get('profit_margin'))} | "
+            f"{fmt_ratio(extras.get('trailing_pe'))}/{fmt_ratio(extras.get('forward_pe'))} | {extras.get('position_52w', 'n/a')} |"
         )
 
-    lines.extend(["", "## Source links", "", "| Symbol | Investing | News | Supply/Flow | Reports |", "|---|---|---|---|---|"])
-    for record in records:
-        symbol = str(record["symbol"])
-        links = dict(record.get("links") or source_links(symbol))
+    lines.extend(
+        [
+            "",
+            "## Daily key news",
+            "",
+            "| Symbol | Theme | Headline | Summary | Checkpoint | Published |",
+            "|---|---|---|---|---|---|",
+        ]
+    )
+    for item in collect_news(records, limit=24):
         lines.append(
-            f"| {symbol} | [Investing]({links['investing']}) | [News]({links['yahoo']}) | "
-            f"[Naver/Flow]({links['naver']}) | [Reports]({links['reports']}) |"
+            f"| {item.get('symbol', '')} | {item.get('theme', '')} | [{item.get('title', '')}]({item.get('link', '')}) | "
+            f"{item.get('summary', '')} | {item.get('angle', '')} | {fmt_datetime(item.get('published_dt'))} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Broker reports",
+            "",
+            "| Date | Category | Subject | Title | Broker | Theme | Summary | Analysis |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+    )
+    for report in research_reports:
+        title = report.get("title", "")
+        title_cell = f"[{title}]({report['read_url']})" if report.get("read_url") else title
+        lines.append(
+            f"| {report.get('date', '')} | {report.get('category', '')} | {report.get('subject', '')} | {title_cell} | "
+            f"{report.get('broker', '')} | {report.get('theme', '')} | {report.get('summary', '')} | {report.get('analysis', '')} |"
         )
 
     report_path.write_text("\n".join(lines), encoding="utf-8-sig")
@@ -431,12 +887,16 @@ def write_html(
     usd_krw: float,
     min_market_cap_usd: float,
     portfolio: dict[str, PortfolioPosition],
+    research_reports: list[dict[str, str]],
 ) -> None:
     PUBLIC_ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
     public_report_path = PUBLIC_ANALYSIS_DIR / report_path.name
     public_report_path.write_bytes(report_path.read_bytes())
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     report_link = report_path.name
+    portfolio_json = json.dumps(portfolio_lookup_data(records, portfolio), ensure_ascii=False)
+    scan_json = json.dumps(scanned_lookup_data(records), ensure_ascii=False)
+    naver_research = source_links("NVDA")["naver_research"]
     html_text = f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -463,6 +923,9 @@ def write_html(
         --accent: #7aa2ff;
       }}
     }}
+    * {{
+      box-sizing: border-box;
+    }}
     body {{
       margin: 0;
       background: var(--bg);
@@ -471,27 +934,46 @@ def write_html(
       line-height: 1.45;
     }}
     main {{
-      max-width: 1220px;
+      max-width: 1260px;
       margin: 0 auto;
       padding: 28px 18px 44px;
     }}
-    h1 {{ margin: 0 0 8px; font-size: 28px; }}
-    h2 {{ margin: 26px 0 10px; font-size: 20px; }}
-    p {{ color: var(--muted); margin: 6px 0 12px; }}
-    a {{ color: var(--accent); font-weight: 700; text-decoration: none; }}
-    code {{ font-family: Consolas, monospace; }}
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 28px;
+      letter-spacing: 0;
+    }}
+    h2 {{
+      margin: 28px 0 10px;
+      font-size: 20px;
+      letter-spacing: 0;
+    }}
+    p {{
+      color: var(--muted);
+      margin: 6px 0 12px;
+    }}
+    a {{
+      color: var(--accent);
+      font-weight: 700;
+      text-decoration: none;
+    }}
+    code {{
+      font-family: Consolas, monospace;
+    }}
     button {{
+      min-height: 38px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel);
       color: var(--text);
-      padding: 9px 12px;
+      padding: 8px 12px;
       font: inherit;
       font-weight: 700;
       cursor: pointer;
     }}
     input {{
       width: min(260px, 100%);
+      min-height: 40px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel);
@@ -519,8 +1001,14 @@ def write_html(
       border-radius: 8px;
       background: var(--panel);
       padding: 12px;
+      min-width: 0;
     }}
-    .metric b {{ display: block; font-size: 20px; margin-top: 4px; }}
+    .metric b {{
+      display: block;
+      font-size: 20px;
+      margin-top: 4px;
+      word-break: break-word;
+    }}
     .toolbar {{
       display: flex;
       flex-wrap: wrap;
@@ -528,15 +1016,45 @@ def write_html(
       align-items: center;
       margin: 16px 0;
     }}
+    .lookup {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+      gap: 12px;
+      margin: 12px 0 18px;
+    }}
+    .lookup-panel {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 14px;
+      min-width: 0;
+    }}
+    .lookup-panel h3 {{
+      margin: 0 0 8px;
+      font-size: 16px;
+    }}
+    .lookup-panel dl {{
+      display: grid;
+      grid-template-columns: 120px minmax(0, 1fr);
+      gap: 6px 10px;
+      margin: 0;
+    }}
+    .lookup-panel dt {{
+      color: var(--muted);
+    }}
+    .lookup-panel dd {{
+      margin: 0;
+      word-break: break-word;
+    }}
     .source-grid {{
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
       margin: 12px 0 18px;
     }}
     .source {{
       display: block;
-      min-height: 112px;
+      min-height: 104px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel);
@@ -556,7 +1074,9 @@ def write_html(
       gap: 8px;
       margin-bottom: 8px;
     }}
-    .scroll {{ overflow-x: auto; }}
+    .scroll {{
+      overflow-x: auto;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -573,16 +1093,29 @@ def write_html(
       white-space: nowrap;
       vertical-align: top;
     }}
+    td:nth-child(4),
+    td:nth-child(7),
+    td:nth-child(8) {{
+      white-space: normal;
+      min-width: 220px;
+    }}
     th {{
       color: var(--muted);
       font-size: 12px;
       text-transform: uppercase;
       letter-spacing: 0;
     }}
-    tr:last-child td {{ border-bottom: 0; }}
-    @media (max-width: 780px) {{
-      .grid {{ grid-template-columns: 1fr 1fr; }}
-      .source-grid {{ grid-template-columns: 1fr; }}
+    tr:last-child td {{
+      border-bottom: 0;
+    }}
+    @media (max-width: 900px) {{
+      .grid {{
+        grid-template-columns: 1fr 1fr;
+      }}
+      .lookup,
+      .source-grid {{
+        grid-template-columns: 1fr;
+      }}
     }}
   </style>
 </head>
@@ -591,55 +1124,32 @@ def write_html(
     <header>
       <h1>종목 분석 창</h1>
       <p>업데이트: {e(now)} / <a href="../index.html" target="_blank" rel="noopener">이치모쿠 창 열기</a> / <a href="{e(report_link)}">markdown</a></p>
-      <p>네가 보낸 기준대로 TradingView, Investing.com, 증권플러스, 네이버증권, 리포트 검색을 따로 열어보는 화면입니다.</p>
+      <p>차트 판단과 분리해서 실적, 뉴스, 평단가·수급, 증권사 리포트를 한 번에 확인하는 학습용 화면입니다.</p>
     </header>
-
-    <section>
-      <h2>분석 바로가기</h2>
-      <div class="toolbar">
-        <input id="symbolInput" value="NVDA" aria-label="symbol">
-        <button type="button" id="applySymbol">종목 적용</button>
-        <button type="button" id="openAll">5개 출처 한번에 열기</button>
-      </div>
-      <div class="chips">{source_launcher(records)}</div>
-      <div class="source-grid">
-        <a class="source" data-link="tradingview" target="_blank" rel="noopener">1. 차트분석: 트레이딩뷰<span>캔들, 이치모쿠, 엔벨롭 등 차트는 여기서 따로 확인</span></a>
-        <a class="source" data-link="investing" target="_blank" rel="noopener">2. 실적 날짜·결과·기업 통계: Investing.com<span>실적 캘린더, 재무/밸류에이션, 기업 주요 수치 확인</span></a>
-        <a class="source" data-link="stockplus" target="_blank" rel="noopener">3. 핵심뉴스: 증권플러스<span>종목 관련 뉴스 흐름과 이슈 확인</span></a>
-        <a class="source" data-link="naver" target="_blank" rel="noopener">4. 평단가 + 기관·외국인·개인: 네이버증권<span>한국 종목은 수급 페이지, 미국 종목은 네이버 검색으로 연결</span></a>
-        <a class="source" data-link="reports" target="_blank" rel="noopener">5. 증권사 리포트: 리포트 검색<span>증권사 리포트와 리포트 요약 자료 검색</span></a>
-      </div>
-    </section>
 
     <div class="grid">
       <div class="metric">분석 종목<b>{len(records)}</b></div>
       <div class="metric">원자료<b>{raw_count}</b></div>
       <div class="metric">USD/KRW<b>{usd_krw:,.2f}</b></div>
-      <div class="metric">제외 ETF<b>{excluded.get('leveraged_or_inverse_etf', 0)}</b></div>
+      <div class="metric">오늘 리포트<b>{len(research_reports)}</b></div>
     </div>
 
     <div class="note">
       주식 시총 필터: KRW {MARKET_CAP_KRW_THRESHOLD:,.0f}+ / USD {min_market_cap_usd:,.0f}+.
       SOXX 같은 일반 ETF는 포함하고 2x·3x·Bull·Bear·Inverse 계열은 제외합니다.
-      평단가는 GitHub에 올리지 않는 <code>portfolio.csv</code> 파일이 있을 때만 계산됩니다.
+      리포트 요약은 공개 목록과 제목·메타데이터 기준의 학습용 요약이며, 원문 판단은 링크에서 확인합니다.
     </div>
 
     <section>
-      <h2>평단가</h2>
-      <div class="scroll">
-        <table>
-          <thead><tr><th>Symbol</th><th>Avg</th><th>Price</th><th>P/L</th><th>Value</th><th>Links</th></tr></thead>
-          <tbody>{portfolio_rows(records, portfolio)}</tbody>
-        </table>
-      </div>
-    </section>
-
-    <section>
-      <h2>2. 실적 날짜와 기업 주요 통계</h2>
+      <h2>실적 날짜·결과·기업 주요 통계</h2>
       <div class="scroll">
         <table>
           <thead>
-            <tr><th>Symbol</th><th>Type</th><th>Price</th><th>Chg</th><th>Volume</th><th>Market Cap</th><th>Earnings</th><th>EPS Avg</th><th>PE T/F</th><th>52w Pos</th><th>Links</th></tr>
+            <tr>
+              <th>Symbol</th><th>Type</th><th>Price</th><th>Chg</th><th>Volume</th><th>Market Cap</th>
+              <th>Next Earnings</th><th>Latest Q</th><th>Revenue</th><th>Net Income</th><th>EPS</th>
+              <th>Revenue Growth</th><th>Margin</th><th>PE T/F</th><th>52w Pos</th><th>Links</th>
+            </tr>
           </thead>
           <tbody>{stats_rows(records)}</tbody>
         </table>
@@ -647,40 +1157,81 @@ def write_html(
     </section>
 
     <section>
-      <h2>3. 핵심 뉴스</h2>
+      <h2>오늘 핵심뉴스</h2>
       <div class="scroll">
         <table>
-          <thead><tr><th>Symbol</th><th>Headline</th><th>Published</th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Theme</th><th>Headline</th><th>요약</th><th>확인 포인트</th><th>Published</th></tr></thead>
           <tbody>{news_rows(records)}</tbody>
         </table>
       </div>
     </section>
 
     <section>
-      <h2>4-5. 수급과 리포트 바로가기</h2>
-      <p>미국 종목은 네이버식 기관·외국인·개인 수급이 직접 제공되지 않아 검색 링크로 연결합니다. 한국 6자리 종목코드는 네이버 수급 페이지로 연결됩니다.</p>
+      <h2>평단가·수급 티커 조회</h2>
+      <div class="toolbar">
+        <input id="symbolInput" value="NVDA" aria-label="symbol">
+        <button type="button" id="applySymbol">종목 적용</button>
+        <button type="button" id="openAll">분석 출처 한번에 열기</button>
+      </div>
+      <div class="chips">{source_launcher(records)}</div>
+      <div class="lookup">
+        <div class="lookup-panel">
+          <h3 id="lookupTitle">종목 조회</h3>
+          <dl id="lookupStats"></dl>
+        </div>
+        <div class="lookup-panel">
+          <h3>평단가</h3>
+          <dl id="portfolioLookup"></dl>
+        </div>
+      </div>
+      <div class="source-grid">
+        <a class="source" data-link="investing" target="_blank" rel="noopener">실적·기업 통계<span>Investing.com 검색으로 실적 캘린더와 주요 지표 확인</span></a>
+        <a class="source" data-link="stockplus" target="_blank" rel="noopener">핵심뉴스<span>증권플러스 종목 뉴스와 이슈 흐름 확인</span></a>
+        <a class="source" data-link="naver" target="_blank" rel="noopener">기관·외국인·개인 수급<span>한국 6자리 종목코드는 네이버 수급 페이지로 연결</span></a>
+        <a class="source" data-link="reports" target="_blank" rel="noopener">증권사 리포트<span>종목별 리포트 검색과 원문 확인</span></a>
+      </div>
       <div class="scroll">
         <table>
-          <thead><tr><th>Symbol</th><th>Supply/Flow</th><th>News</th><th>Broker Reports</th><th>Analyst</th></tr></thead>
-          <tbody>{link_rows(records)}</tbody>
+          <thead><tr><th>Symbol</th><th>Avg</th><th>Qty</th><th>Price</th><th>P/L</th><th>Value</th></tr></thead>
+          <tbody>{portfolio_rows(records, portfolio)}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>증권사 리포트</h2>
+      <p><a href="{e(naver_research)}" target="_blank" rel="noopener">네이버 리서치 원문 목록</a> 기준으로 최신 리포트를 모읍니다.</p>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>Date</th><th>Category</th><th>Subject</th><th>Title</th><th>Broker</th><th>Theme</th><th>요약</th><th>분석</th><th>PDF</th></tr>
+          </thead>
+          <tbody>{report_rows(research_reports)}</tbody>
         </table>
       </div>
     </section>
   </main>
   <script>
     const input = document.getElementById("symbolInput");
+    const portfolioData = {portfolio_json};
+    const scannedData = {scan_json};
     const sources = {{
-      tradingview: (symbol) => `https://www.tradingview.com/chart/?symbol=${{encodeURIComponent(symbol)}}`,
       investing: (symbol) => `https://www.investing.com/search/?q=${{encodeURIComponent(symbol)}}`,
       stockplus: (symbol) => `https://stockplus.com/search?q=${{encodeURIComponent(symbol)}}`,
       naver: (symbol) => /^\\d{{6}}$/.test(symbol)
         ? `https://finance.naver.com/item/frgn.naver?code=${{symbol}}`
-        : `https://search.naver.com/search.naver?query=${{encodeURIComponent(symbol + " 주식")}}`,
+        : `https://search.naver.com/search.naver?query=${{encodeURIComponent(symbol + " 주식 기관 외국인 개인")}}`,
       reports: (symbol) => `https://www.google.com/search?q=${{encodeURIComponent(symbol + " 증권사 리포트")}}`,
     }};
 
     function currentSymbol() {{
       return (input.value || "NVDA").trim().toUpperCase();
+    }}
+
+    function rowsFromObject(data) {{
+      return Object.entries(data)
+        .map(([key, value]) => `<dt>${{key}}</dt><dd>${{value}}</dd>`)
+        .join("");
     }}
 
     function applySymbol() {{
@@ -689,6 +1240,37 @@ def write_html(
       document.querySelectorAll("[data-link]").forEach((link) => {{
         link.href = sources[link.dataset.link](symbol);
       }});
+
+      const scanned = scannedData[symbol];
+      const stats = scanned
+        ? {{
+            이름: scanned.name,
+            구분: scanned.type,
+            현재가: scanned.price,
+            등락률: scanned.change_pct,
+            거래량: scanned.volume,
+            시가총액: scanned.market_cap,
+            다음실적: scanned.next_earnings,
+            최근분기: scanned.latest_quarter,
+            최근매출: scanned.latest_revenue,
+            순이익: scanned.latest_net_income,
+            EPS: scanned.latest_eps,
+          }}
+        : {{안내: "현재 거래량 상위 스캔 원자료에는 없는 티커입니다. 아래 출처 링크로 직접 확인하세요."}};
+      document.getElementById("lookupTitle").textContent = `${{symbol}} 조회`;
+      document.getElementById("lookupStats").innerHTML = rowsFromObject(stats);
+
+      const position = portfolioData[symbol];
+      const portfolio = position
+        ? {{
+            평단: position.average_price,
+            수량: position.quantity,
+            현재가: position.price,
+            손익률: position.pnl_pct,
+            평가금액: position.value,
+          }}
+        : {{안내: "portfolio.csv에 이 티커가 없거나 공개 Pages 빌드에는 평단가가 포함되지 않았습니다."}};
+      document.getElementById("portfolioLookup").innerHTML = rowsFromObject(portfolio);
     }}
 
     document.getElementById("applySymbol").addEventListener("click", applySymbol);
@@ -703,7 +1285,7 @@ def write_html(
     }});
     document.getElementById("openAll").addEventListener("click", () => {{
       applySymbol();
-      ["tradingview", "investing", "stockplus", "naver", "reports"].forEach((key, index) => {{
+      ["investing", "stockplus", "naver", "reports"].forEach((key, index) => {{
         window.setTimeout(() => window.open(sources[key](currentSymbol()), "_blank", "noopener"), index * 100);
       }});
     }});
@@ -734,6 +1316,7 @@ def main() -> None:
     parser.add_argument("--screen-count", type=int, default=DEFAULT_SCREEN_COUNT)
     parser.add_argument("--enrich-limit", type=int, default=25)
     parser.add_argument("--news-limit", type=int, default=25)
+    parser.add_argument("--report-limit", type=int, default=36)
     args = parser.parse_args()
 
     ensure_portfolio_example()
@@ -741,6 +1324,7 @@ def main() -> None:
     universe, raw_count, excluded, usd_krw, min_market_cap_usd = load_universe(args.count, args.screen_count)
     records = enrich_records(universe, enrich_limit=args.enrich_limit, news_limit=args.news_limit)
     portfolio = read_portfolio()
+    research_reports = fetch_naver_research_reports(limit=args.report_limit)
     report_path = write_markdown(
         records,
         raw_count=raw_count,
@@ -748,6 +1332,7 @@ def main() -> None:
         usd_krw=usd_krw,
         min_market_cap_usd=min_market_cap_usd,
         portfolio=portfolio,
+        research_reports=research_reports,
         stamp=stamp,
     )
     write_html(
@@ -758,6 +1343,7 @@ def main() -> None:
         usd_krw=usd_krw,
         min_market_cap_usd=min_market_cap_usd,
         portfolio=portfolio,
+        research_reports=research_reports,
     )
     print(f"analysis briefing: {PUBLIC_ANALYSIS_DIR / 'index.html'}")
     print(f"report: {report_path.name}")

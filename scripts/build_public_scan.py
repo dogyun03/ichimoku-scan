@@ -152,7 +152,7 @@ def build_page(regular: ScanRun, prepost: ScanRun, regular_links: dict[str, str]
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ichimoku Volume Scan</title>
+  <title>Stock Learning Dashboard</title>
   <style>
     :root {{
       color-scheme: light dark;
@@ -295,8 +295,8 @@ def build_page(regular: ScanRun, prepost: ScanRun, regular_links: dict[str, str]
     </section>
     <section id="view-analysis" class="view hidden">
       <div class="note">
-        종목 분석 탭에는 TradingView, Investing.com, 증권플러스, 네이버증권, 리포트 검색 화면이 들어갑니다.
-        아래 화면에서 종목코드를 바꾸고 5개 출처를 바로 열 수 있습니다.
+        종목 분석 탭에는 차트 판단을 빼고 실적, 뉴스, 평단가·수급, 증권사 리포트 자료가 들어갑니다.
+        차트는 이치모쿠 스캔 탭에서 보고, 자료 확인은 아래 분석 창에서 따로 합니다.
       </div>
       <iframe class="analysis-frame" src="analysis/index.html" title="종목 분석"></iframe>
     </section>
