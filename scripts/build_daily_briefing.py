@@ -237,7 +237,137 @@ def latest_statement_period(statement: object) -> str:
     return fmt_date(columns[0])
 
 
-def fetch_yahoo_extras(symbol: str) -> dict[str, object]:
+def price_target_summary(targets: object) -> str:
+    if not isinstance(targets, dict):
+        return ""
+    current = fmt_price(targets.get("current"))
+    mean = fmt_price(targets.get("mean"))
+    median = fmt_price(targets.get("median"))
+    high = fmt_price(targets.get("high"))
+    low = fmt_price(targets.get("low"))
+    if all(value == "n/a" for value in (mean, median, high, low)):
+        return ""
+    return f"현재 {current} / 평균 {mean} / 중앙 {median} / 고 {high} / 저 {low}"
+
+
+def recommendation_mix(summary: object) -> str:
+    if summary is None or getattr(summary, "empty", True):
+        return ""
+    try:
+        row = summary.iloc[0]
+    except Exception:
+        return ""
+    parts = [
+        f"강매수 {fmt_number(row.get('strongBuy'))}",
+        f"매수 {fmt_number(row.get('buy'))}",
+        f"보유 {fmt_number(row.get('hold'))}",
+        f"매도 {fmt_number(row.get('sell'))}",
+        f"강매도 {fmt_number(row.get('strongSell'))}",
+    ]
+    return " / ".join(parts)
+
+
+def analyst_action_ko(action: object, price_target_action: object) -> str:
+    target_text = clean_text(price_target_action).lower()
+    action_text = clean_text(action).lower()
+    if "raise" in target_text:
+        return "목표가 상향"
+    if "lower" in target_text or "drop" in target_text:
+        return "목표가 하향"
+    if "maintain" in target_text:
+        return "목표가 유지"
+    if "announce" in target_text:
+        return "목표가 제시"
+    if action_text in {"init", "initiates"}:
+        return "신규 커버리지"
+    if action_text in {"up", "upgrade"}:
+        return "투자의견 상향"
+    if action_text in {"down", "downgrade"}:
+        return "투자의견 하향"
+    if action_text in {"main", "reit"}:
+        return "투자의견 유지"
+    return "애널리스트 업데이트"
+
+
+def foreign_report_summary(symbol: str, report: dict[str, str]) -> str:
+    firm = report.get("firm") or "해외 증권사"
+    action = report.get("action_ko") or "업데이트"
+    grade = report.get("grade_change") or "등급 정보 없음"
+    target = report.get("target_change") or "목표가 정보 없음"
+    return f"{firm}가 {symbol}에 대해 {action} 의견을 냈습니다. {grade}, {target}."
+
+
+def foreign_report_analysis(report: dict[str, str]) -> str:
+    action = report.get("action_ko", "")
+    grade = f"{report.get('to_grade', '')} {report.get('from_grade', '')}".lower()
+    if "하향" in action:
+        return "해외 톤은 부담 쪽입니다. 반등보다 목표가·등급 하향의 지속 여부를 봅니다."
+    if "상향" in action or any(word in grade for word in ("buy", "outperform", "overweight")):
+        return "해외 톤은 우호적입니다. 단기 가격보다 컨센서스가 이어지는지 확인합니다."
+    if any(word in grade for word in ("sell", "underperform", "underweight")):
+        return "해외 톤은 부담 쪽입니다. 반등보다 목표가·등급 하향의 지속 여부를 봅니다."
+    return "해외 톤은 유지·점검 성격입니다. 기존 추세를 바꿀 정도의 변화인지 확인합니다."
+
+
+def fetch_foreign_analyst_bundle(symbol: str, ticker: yf.Ticker, limit: int) -> dict[str, object]:
+    bundle: dict[str, object] = {"reports": [], "price_targets": "", "recommendation_mix": ""}
+    if limit <= 0:
+        return bundle
+
+    try:
+        targets = ticker.analyst_price_targets
+        bundle["price_targets"] = price_target_summary(targets)
+    except Exception:
+        pass
+
+    try:
+        summary = ticker.recommendations_summary
+        bundle["recommendation_mix"] = recommendation_mix(summary)
+    except Exception:
+        pass
+
+    try:
+        actions = ticker.upgrades_downgrades
+    except Exception:
+        actions = None
+
+    if actions is None or getattr(actions, "empty", True):
+        return bundle
+
+    reports: list[dict[str, str]] = []
+    try:
+        rows = actions.head(limit).iterrows()
+    except Exception:
+        return bundle
+
+    for index, row in rows:
+        from_grade = clean_text(row.get("FromGrade"))
+        to_grade = clean_text(row.get("ToGrade"))
+        current_target = fmt_price(row.get("currentPriceTarget"))
+        prior_target = fmt_price(row.get("priorPriceTarget"))
+        grade_change = f"{from_grade or 'n/a'} -> {to_grade or 'n/a'}"
+        target_change = f"{prior_target} -> {current_target}" if current_target != "n/a" else ""
+        report = {
+            "symbol": symbol,
+            "date": fmt_datetime(index),
+            "firm": clean_text(row.get("Firm")) or "n/a",
+            "action_ko": analyst_action_ko(row.get("Action"), row.get("priceTargetAction")),
+            "from_grade": from_grade,
+            "to_grade": to_grade,
+            "grade_change": grade_change,
+            "target_change": target_change,
+            "price_targets": str(bundle.get("price_targets") or ""),
+            "recommendation_mix": str(bundle.get("recommendation_mix") or ""),
+            "link": source_links(symbol)["yahoo_analysis"],
+        }
+        report["summary"] = foreign_report_summary(symbol, report)
+        report["analysis"] = foreign_report_analysis(report)
+        reports.append(report)
+    bundle["reports"] = reports
+    return bundle
+
+
+def fetch_yahoo_extras(symbol: str, *, foreign_report_limit: int = 0) -> dict[str, object]:
     ticker = yf.Ticker(symbol)
     info: dict[str, object] = {}
     calendar: dict[str, object] = {}
@@ -275,6 +405,7 @@ def fetch_yahoo_extras(symbol: str) -> dict[str, object]:
         or date_from_timestamp(info.get("earningsTimestampStart"))
         or date_from_timestamp(info.get("earningsTimestamp"))
     )
+    foreign_bundle = fetch_foreign_analyst_bundle(symbol, ticker, foreign_report_limit)
 
     return {
         "sector": info.get("sector") or "n/a",
@@ -302,6 +433,9 @@ def fetch_yahoo_extras(symbol: str) -> dict[str, object]:
             ],
         ),
         "latest_eps": first_metric(statement, ["Diluted EPS", "Basic EPS"]),
+        "analyst_price_target_summary": foreign_bundle.get("price_targets", ""),
+        "analyst_recommendation_mix": foreign_bundle.get("recommendation_mix", ""),
+        "foreign_reports": foreign_bundle.get("reports", []),
     }
 
 
@@ -349,6 +483,28 @@ def news_summary(symbol: str, title: str) -> str:
     return f"{symbol}의 개별 재료가 기존 추세를 강화하는지 확인할 뉴스입니다."
 
 
+def korean_news_title(symbol: str, title: str) -> str:
+    theme = news_theme(title)
+    text = title.lower()
+    if "why" in text and "stock" in text:
+        return f"{symbol} 주가 변동 배경"
+    if "earnings" in text or "guidance" in text:
+        return f"{symbol} 실적·가이던스 이슈"
+    if "analyst" in text or "rating" in text or "target" in text:
+        return f"{symbol} 애널리스트 의견 변화"
+    if "upgrade" in text:
+        return f"{symbol} 투자의견 상향 관련 뉴스"
+    if "downgrade" in text:
+        return f"{symbol} 투자의견 하향 관련 뉴스"
+    if "ai" in text or "chip" in text or "semiconductor" in text:
+        return f"{symbol} AI·반도체 수요 관련 뉴스"
+    if "stock" in text and ("rise" in text or "jump" in text or "gain" in text):
+        return f"{symbol} 주가 강세 관련 뉴스"
+    if "stock" in text and ("fall" in text or "drop" in text or "sink" in text):
+        return f"{symbol} 주가 약세 관련 뉴스"
+    return f"{symbol} {theme} 핵심 뉴스"
+
+
 def news_angle(title: str) -> str:
     theme = news_theme(title)
     if theme in {"실적/가이던스", "애널리스트"}:
@@ -390,6 +546,7 @@ def fetch_news(symbol: str, limit: int) -> list[dict[str, object]]:
                     "published": published,
                     "published_dt": published_dt,
                     "theme": news_theme(title),
+                    "ko_title": korean_news_title(symbol, title),
                     "summary": news_summary(symbol, title),
                     "angle": news_angle(title),
                 }
@@ -586,13 +743,16 @@ def enrich_records(
     *,
     enrich_limit: int,
     news_limit: int,
+    foreign_symbol_limit: int,
+    foreign_report_per_symbol: int,
 ) -> list[dict[str, object]]:
     enriched: list[dict[str, object]] = []
     for idx, record in enumerate(records):
         symbol = str(record["symbol"])
         item = dict(record)
         item["links"] = source_links(symbol)
-        item["extras"] = fetch_yahoo_extras(symbol) if idx < enrich_limit else {}
+        foreign_limit = foreign_report_per_symbol if idx < foreign_symbol_limit else 0
+        item["extras"] = fetch_yahoo_extras(symbol, foreign_report_limit=foreign_limit) if idx < enrich_limit else {}
         item["news"] = fetch_news(symbol, 2) if idx < news_limit else []
         enriched.append(item)
     return enriched
@@ -706,6 +866,17 @@ def collect_news(records: list[dict[str, object]], limit: int = 24) -> list[dict
     return items[:limit]
 
 
+def collect_foreign_reports(records: list[dict[str, object]], limit: int = 24) -> list[dict[str, str]]:
+    reports: list[dict[str, str]] = []
+    for record in records:
+        extras = dict(record.get("extras") or {})
+        for report in list(extras.get("foreign_reports") or []):
+            reports.append(dict(report))
+            if len(reports) >= limit:
+                return reports
+    return reports
+
+
 def news_rows(records: list[dict[str, object]]) -> str:
     rows: list[str] = []
     for item in collect_news(records):
@@ -713,14 +884,15 @@ def news_rows(records: list[dict[str, object]]) -> str:
             "<tr>"
             f"<td>{e(item.get('symbol', ''))}</td>"
             f"<td>{e(item.get('theme', '기업 이슈'))}</td>"
-            f'<td><a href="{e(item.get("link", ""))}">{e(item.get("title", ""))}</a></td>'
+            f'<td><a href="{e(item.get("link", ""))}">{e(item.get("ko_title", ""))}</a></td>'
             f"<td>{e(item.get('summary', ''))}</td>"
             f"<td>{e(item.get('angle', ''))}</td>"
+            f"<td>{e(item.get('title', ''))}</td>"
             f"<td>{fmt_datetime(item.get('published_dt'))}</td>"
             "</tr>"
         )
     if not rows:
-        return '<tr><td colspan="6">자동 수집된 핵심 뉴스가 없습니다. 종목별 뉴스 링크에서 직접 확인하세요.</td></tr>'
+        return '<tr><td colspan="7">자동 수집된 핵심 뉴스가 없습니다. 종목별 뉴스 링크에서 직접 확인하세요.</td></tr>'
     return "".join(rows)
 
 
@@ -747,6 +919,29 @@ def report_rows(reports: list[dict[str, str]]) -> str:
         )
     if not rows:
         return '<tr><td colspan="9">오늘 수집된 네이버 리서치 목록이 없습니다.</td></tr>'
+    return "".join(rows)
+
+
+def foreign_report_rows(reports: list[dict[str, str]]) -> str:
+    rows: list[str] = []
+    for report in reports:
+        rows.append(
+            "<tr>"
+            f"<td>{e(report.get('symbol', ''))}</td>"
+            f"<td>{e(report.get('date', ''))}</td>"
+            f"<td>{e(report.get('firm', ''))}</td>"
+            f"<td>{e(report.get('action_ko', ''))}</td>"
+            f"<td>{e(report.get('grade_change', ''))}</td>"
+            f"<td>{e(report.get('target_change', ''))}</td>"
+            f"<td>{e(report.get('price_targets', ''))}</td>"
+            f"<td>{e(report.get('recommendation_mix', ''))}</td>"
+            f"<td>{e(report.get('summary', ''))}</td>"
+            f"<td>{e(report.get('analysis', ''))}</td>"
+            f'<td><a href="{e(report.get("link", ""))}" target="_blank" rel="noopener">Yahoo</a></td>'
+            "</tr>"
+        )
+    if not rows:
+        return '<tr><td colspan="11">자동 수집된 해외 애널리스트 업데이트가 없습니다.</td></tr>'
     return "".join(rows)
 
 
@@ -830,14 +1025,31 @@ def write_markdown(
             "",
             "## Daily key news",
             "",
-            "| Symbol | Theme | Headline | Summary | Checkpoint | Published |",
-            "|---|---|---|---|---|---|",
+            "| Symbol | Theme | Korean Brief | Summary | Checkpoint | Original | Published |",
+            "|---|---|---|---|---|---|---|",
         ]
     )
     for item in collect_news(records, limit=24):
         lines.append(
-            f"| {item.get('symbol', '')} | {item.get('theme', '')} | [{item.get('title', '')}]({item.get('link', '')}) | "
-            f"{item.get('summary', '')} | {item.get('angle', '')} | {fmt_datetime(item.get('published_dt'))} |"
+            f"| {item.get('symbol', '')} | {item.get('theme', '')} | [{item.get('ko_title', '')}]({item.get('link', '')}) | "
+            f"{item.get('summary', '')} | {item.get('angle', '')} | {item.get('title', '')} | {fmt_datetime(item.get('published_dt'))} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Overseas analyst updates",
+            "",
+            "| Symbol | Date | Firm | Action | Grade | Target | Consensus Target | Rating Mix | Summary | Analysis |",
+            "|---|---|---|---|---|---|---|---|---|---|",
+        ]
+    )
+    for report in collect_foreign_reports(records, limit=24):
+        lines.append(
+            f"| {report.get('symbol', '')} | {report.get('date', '')} | {report.get('firm', '')} | "
+            f"{report.get('action_ko', '')} | {report.get('grade_change', '')} | {report.get('target_change', '')} | "
+            f"{report.get('price_targets', '')} | {report.get('recommendation_mix', '')} | "
+            f"{report.get('summary', '')} | {report.get('analysis', '')} |"
         )
 
     lines.extend(
@@ -897,6 +1109,7 @@ def write_html(
     portfolio_json = json.dumps(portfolio_lookup_data(records, portfolio), ensure_ascii=False)
     scan_json = json.dumps(scanned_lookup_data(records), ensure_ascii=False)
     naver_research = source_links("NVDA")["naver_research"]
+    foreign_reports = collect_foreign_reports(records, limit=24)
     html_text = f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -992,7 +1205,7 @@ def write_html(
     }}
     .grid {{
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 10px;
       margin: 16px 0;
     }}
@@ -1074,6 +1287,28 @@ def write_html(
       gap: 8px;
       margin-bottom: 8px;
     }}
+    .section-tabs {{
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding: 10px 0;
+      background: var(--bg);
+      border-bottom: 1px solid var(--line);
+    }}
+    .section-tab {{
+      white-space: nowrap;
+    }}
+    .section-tab.active {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #ffffff;
+    }}
+    .data-section.hidden {{
+      display: none;
+    }}
     .scroll {{
       overflow-x: auto;
     }}
@@ -1131,7 +1366,8 @@ def write_html(
       <div class="metric">분석 종목<b>{len(records)}</b></div>
       <div class="metric">원자료<b>{raw_count}</b></div>
       <div class="metric">USD/KRW<b>{usd_krw:,.2f}</b></div>
-      <div class="metric">오늘 리포트<b>{len(research_reports)}</b></div>
+      <div class="metric">국내 리포트<b>{len(research_reports)}</b></div>
+      <div class="metric">해외 업데이트<b>{len(foreign_reports)}</b></div>
     </div>
 
     <div class="note">
@@ -1140,7 +1376,15 @@ def write_html(
       리포트 요약은 공개 목록과 제목·메타데이터 기준의 학습용 요약이며, 원문 판단은 링크에서 확인합니다.
     </div>
 
-    <section>
+    <nav class="section-tabs" aria-label="분석 자료 선택">
+      <button type="button" class="section-tab active" data-section="stats">실적/통계</button>
+      <button type="button" class="section-tab" data-section="news">핵심뉴스</button>
+      <button type="button" class="section-tab" data-section="lookup">평단/수급</button>
+      <button type="button" class="section-tab" data-section="domesticReports">국내 리포트</button>
+      <button type="button" class="section-tab" data-section="foreignReports">해외 리포트</button>
+    </nav>
+
+    <section id="section-stats" class="data-section">
       <h2>실적 날짜·결과·기업 주요 통계</h2>
       <div class="scroll">
         <table>
@@ -1156,17 +1400,17 @@ def write_html(
       </div>
     </section>
 
-    <section>
+    <section id="section-news" class="data-section hidden">
       <h2>오늘 핵심뉴스</h2>
       <div class="scroll">
         <table>
-          <thead><tr><th>Symbol</th><th>Theme</th><th>Headline</th><th>요약</th><th>확인 포인트</th><th>Published</th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Theme</th><th>한국어 브리핑</th><th>요약</th><th>확인 포인트</th><th>원문 제목</th><th>Published</th></tr></thead>
           <tbody>{news_rows(records)}</tbody>
         </table>
       </div>
     </section>
 
-    <section>
+    <section id="section-lookup" class="data-section hidden">
       <h2>평단가·수급 티커 조회</h2>
       <div class="toolbar">
         <input id="symbolInput" value="NVDA" aria-label="symbol">
@@ -1198,7 +1442,7 @@ def write_html(
       </div>
     </section>
 
-    <section>
+    <section id="section-domesticReports" class="data-section hidden">
       <h2>증권사 리포트</h2>
       <p><a href="{e(naver_research)}" target="_blank" rel="noopener">네이버 리서치 원문 목록</a> 기준으로 최신 리포트를 모읍니다.</p>
       <div class="scroll">
@@ -1207,6 +1451,22 @@ def write_html(
             <tr><th>Date</th><th>Category</th><th>Subject</th><th>Title</th><th>Broker</th><th>Theme</th><th>요약</th><th>분석</th><th>PDF</th></tr>
           </thead>
           <tbody>{report_rows(research_reports)}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="section-foreignReports" class="data-section hidden">
+      <h2>해외 증권사 리포트</h2>
+      <p>Yahoo Finance의 해외 애널리스트 등급·목표가 업데이트를 모읍니다. 전문 리포트가 공개되지 않는 경우가 많아, 공개 메타데이터와 원문 링크 중심으로 정리합니다.</p>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th><th>Date</th><th>Firm</th><th>Action</th><th>Grade</th><th>Target</th>
+              <th>Consensus Target</th><th>Rating Mix</th><th>요약</th><th>분석</th><th>Link</th>
+            </tr>
+          </thead>
+          <tbody>{foreign_report_rows(foreign_reports)}</tbody>
         </table>
       </div>
     </section>
@@ -1273,6 +1533,28 @@ def write_html(
       document.getElementById("portfolioLookup").innerHTML = rowsFromObject(portfolio);
     }}
 
+    const sectionButtons = document.querySelectorAll("[data-section]");
+    const sections = {{
+      stats: document.getElementById("section-stats"),
+      news: document.getElementById("section-news"),
+      lookup: document.getElementById("section-lookup"),
+      domesticReports: document.getElementById("section-domesticReports"),
+      foreignReports: document.getElementById("section-foreignReports"),
+    }};
+
+    function showSection(name) {{
+      Object.entries(sections).forEach(([key, section]) => {{
+        section.classList.toggle("hidden", key !== name);
+      }});
+      sectionButtons.forEach((button) => {{
+        button.classList.toggle("active", button.dataset.section === name);
+      }});
+      window.scrollTo({{ top: 0, behavior: "smooth" }});
+    }}
+
+    sectionButtons.forEach((button) => {{
+      button.addEventListener("click", () => showSection(button.dataset.section));
+    }});
     document.getElementById("applySymbol").addEventListener("click", applySymbol);
     input.addEventListener("keydown", (event) => {{
       if (event.key === "Enter") applySymbol();
@@ -1317,12 +1599,20 @@ def main() -> None:
     parser.add_argument("--enrich-limit", type=int, default=25)
     parser.add_argument("--news-limit", type=int, default=25)
     parser.add_argument("--report-limit", type=int, default=36)
+    parser.add_argument("--foreign-symbol-limit", type=int, default=14)
+    parser.add_argument("--foreign-report-per-symbol", type=int, default=2)
     args = parser.parse_args()
 
     ensure_portfolio_example()
     stamp = datetime.now(KST).strftime("%Y%m%d_%H%M")
     universe, raw_count, excluded, usd_krw, min_market_cap_usd = load_universe(args.count, args.screen_count)
-    records = enrich_records(universe, enrich_limit=args.enrich_limit, news_limit=args.news_limit)
+    records = enrich_records(
+        universe,
+        enrich_limit=args.enrich_limit,
+        news_limit=args.news_limit,
+        foreign_symbol_limit=args.foreign_symbol_limit,
+        foreign_report_per_symbol=args.foreign_report_per_symbol,
+    )
     portfolio = read_portfolio()
     research_reports = fetch_naver_research_reports(limit=args.report_limit)
     report_path = write_markdown(
