@@ -17,6 +17,7 @@ import yfinance as yf
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "outputs"
+PUBLIC_ANALYSIS_DIR = ROOT / "public" / "analysis"
 PUBLIC_DAILY_DIR = ROOT / "public" / "daily"
 PORTFOLIO_PATH = ROOT / "portfolio.csv"
 KST = ZoneInfo("Asia/Seoul")
@@ -94,6 +95,7 @@ def source_links(symbol: str) -> dict[str, str]:
     stockplus_query = urllib.parse.quote(symbol)
     naver_query = urllib.parse.quote(f"{symbol} 주식")
     return {
+        "tradingview": f"https://www.tradingview.com/chart/?symbol={encoded}",
         "yahoo": f"https://finance.yahoo.com/quote/{encoded}/",
         "yahoo_stats": f"https://finance.yahoo.com/quote/{encoded}/key-statistics/",
         "yahoo_analysis": f"https://finance.yahoo.com/quote/{encoded}/analysis/",
@@ -329,6 +331,14 @@ def link_rows(records: list[dict[str, object]]) -> str:
     return "".join(rows)
 
 
+def source_launcher(records: list[dict[str, object]]) -> str:
+    buttons = []
+    for record in records[:16]:
+        symbol = str(record["symbol"])
+        buttons.append(f'<button type="button" data-symbol="{e(symbol)}">{e(symbol)}</button>')
+    return "".join(buttons)
+
+
 def write_markdown(
     records: list[dict[str, object]],
     *,
@@ -343,10 +353,10 @@ def write_markdown(
     report_path = OUTPUT_DIR / f"daily_market_briefing_{stamp}.md"
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     lines = [
-        "# Daily Market Briefing",
+        "# Stock Analysis Briefing",
         "",
         f"- Update: `{now}`",
-        "- Scope: chart analysis excluded",
+        "- Scope: source briefing separated from Ichimoku scan",
         "- Universe source: Yahoo Finance `most_actives` + `most_actives_etfs`",
         f"- Raw symbols fetched: `{raw_count}`",
         f"- Filtered universe analyzed: `{len(records)}`",
@@ -395,6 +405,23 @@ def write_markdown(
     return report_path
 
 
+def write_daily_redirect() -> None:
+    PUBLIC_DAILY_DIR.mkdir(parents=True, exist_ok=True)
+    html_text = """<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="0; url=../analysis/">
+  <title>Moved</title>
+</head>
+<body>
+  <p><a href="../analysis/">종목 분석 창으로 이동</a></p>
+</body>
+</html>
+"""
+    (PUBLIC_DAILY_DIR / "index.html").write_text(html_text, encoding="utf-8")
+
+
 def write_html(
     records: list[dict[str, object]],
     *,
@@ -405,8 +432,8 @@ def write_html(
     min_market_cap_usd: float,
     portfolio: dict[str, PortfolioPosition],
 ) -> None:
-    PUBLIC_DAILY_DIR.mkdir(parents=True, exist_ok=True)
-    public_report_path = PUBLIC_DAILY_DIR / report_path.name
+    PUBLIC_ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
+    public_report_path = PUBLIC_ANALYSIS_DIR / report_path.name
     public_report_path.write_bytes(report_path.read_bytes())
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
     report_link = report_path.name
@@ -415,7 +442,7 @@ def write_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Daily Market Briefing</title>
+  <title>Stock Analysis Window</title>
   <style>
     :root {{
       color-scheme: light dark;
@@ -453,6 +480,26 @@ def write_html(
     p {{ color: var(--muted); margin: 6px 0 12px; }}
     a {{ color: var(--accent); font-weight: 700; text-decoration: none; }}
     code {{ font-family: Consolas, monospace; }}
+    button {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 9px 12px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    input {{
+      width: min(260px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+      text-transform: uppercase;
+    }}
     .note {{
       padding: 12px 14px;
       border: 1px solid var(--line);
@@ -474,6 +521,41 @@ def write_html(
       padding: 12px;
     }}
     .metric b {{ display: block; font-size: 20px; margin-top: 4px; }}
+    .toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin: 16px 0;
+    }}
+    .source-grid {{
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      margin: 12px 0 18px;
+    }}
+    .source {{
+      display: block;
+      min-height: 112px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 14px;
+      color: var(--text);
+    }}
+    .source span {{
+      display: block;
+      color: var(--muted);
+      font-weight: 400;
+      margin-top: 6px;
+      white-space: normal;
+    }}
+    .chips {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+    }}
     .scroll {{ overflow-x: auto; }}
     table {{
       width: 100%;
@@ -500,16 +582,34 @@ def write_html(
     tr:last-child td {{ border-bottom: 0; }}
     @media (max-width: 780px) {{
       .grid {{ grid-template-columns: 1fr 1fr; }}
+      .source-grid {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
 <body>
   <main>
     <header>
-      <h1>데일리 종목 브리핑</h1>
-      <p>업데이트: {e(now)} / 차트 분석 제외 / <a href="../index.html">이치모쿠 스캔 보기</a> / <a href="{e(report_link)}">markdown</a></p>
-      <p>실적 날짜, 기업 주요 통계, 핵심 뉴스, 평단가, 수급·리포트 링크를 한 화면에 모았습니다.</p>
+      <h1>종목 분석 창</h1>
+      <p>업데이트: {e(now)} / <a href="../index.html" target="_blank" rel="noopener">이치모쿠 창 열기</a> / <a href="{e(report_link)}">markdown</a></p>
+      <p>네가 보낸 기준대로 TradingView, Investing.com, 증권플러스, 네이버증권, 리포트 검색을 따로 열어보는 화면입니다.</p>
     </header>
+
+    <section>
+      <h2>분석 바로가기</h2>
+      <div class="toolbar">
+        <input id="symbolInput" value="NVDA" aria-label="symbol">
+        <button type="button" id="applySymbol">종목 적용</button>
+        <button type="button" id="openAll">5개 출처 한번에 열기</button>
+      </div>
+      <div class="chips">{source_launcher(records)}</div>
+      <div class="source-grid">
+        <a class="source" data-link="tradingview" target="_blank" rel="noopener">1. 차트분석: 트레이딩뷰<span>캔들, 이치모쿠, 엔벨롭 등 차트는 여기서 따로 확인</span></a>
+        <a class="source" data-link="investing" target="_blank" rel="noopener">2. 실적 날짜·결과·기업 통계: Investing.com<span>실적 캘린더, 재무/밸류에이션, 기업 주요 수치 확인</span></a>
+        <a class="source" data-link="stockplus" target="_blank" rel="noopener">3. 핵심뉴스: 증권플러스<span>종목 관련 뉴스 흐름과 이슈 확인</span></a>
+        <a class="source" data-link="naver" target="_blank" rel="noopener">4. 평단가 + 기관·외국인·개인: 네이버증권<span>한국 종목은 수급 페이지, 미국 종목은 네이버 검색으로 연결</span></a>
+        <a class="source" data-link="reports" target="_blank" rel="noopener">5. 증권사 리포트: 리포트 검색<span>증권사 리포트와 리포트 요약 자료 검색</span></a>
+      </div>
+    </section>
 
     <div class="grid">
       <div class="metric">분석 종목<b>{len(records)}</b></div>
@@ -535,7 +635,7 @@ def write_html(
     </section>
 
     <section>
-      <h2>실적 날짜와 기업 주요 통계</h2>
+      <h2>2. 실적 날짜와 기업 주요 통계</h2>
       <div class="scroll">
         <table>
           <thead>
@@ -547,7 +647,7 @@ def write_html(
     </section>
 
     <section>
-      <h2>핵심 뉴스</h2>
+      <h2>3. 핵심 뉴스</h2>
       <div class="scroll">
         <table>
           <thead><tr><th>Symbol</th><th>Headline</th><th>Published</th></tr></thead>
@@ -557,7 +657,7 @@ def write_html(
     </section>
 
     <section>
-      <h2>수급과 리포트 바로가기</h2>
+      <h2>4-5. 수급과 리포트 바로가기</h2>
       <p>미국 종목은 네이버식 기관·외국인·개인 수급이 직접 제공되지 않아 검색 링크로 연결합니다. 한국 6자리 종목코드는 네이버 수급 페이지로 연결됩니다.</p>
       <div class="scroll">
         <table>
@@ -567,10 +667,53 @@ def write_html(
       </div>
     </section>
   </main>
+  <script>
+    const input = document.getElementById("symbolInput");
+    const sources = {{
+      tradingview: (symbol) => `https://www.tradingview.com/chart/?symbol=${{encodeURIComponent(symbol)}}`,
+      investing: (symbol) => `https://www.investing.com/search/?q=${{encodeURIComponent(symbol)}}`,
+      stockplus: (symbol) => `https://stockplus.com/search?q=${{encodeURIComponent(symbol)}}`,
+      naver: (symbol) => /^\\d{{6}}$/.test(symbol)
+        ? `https://finance.naver.com/item/frgn.naver?code=${{symbol}}`
+        : `https://search.naver.com/search.naver?query=${{encodeURIComponent(symbol + " 주식")}}`,
+      reports: (symbol) => `https://www.google.com/search?q=${{encodeURIComponent(symbol + " 증권사 리포트")}}`,
+    }};
+
+    function currentSymbol() {{
+      return (input.value || "NVDA").trim().toUpperCase();
+    }}
+
+    function applySymbol() {{
+      const symbol = currentSymbol();
+      input.value = symbol;
+      document.querySelectorAll("[data-link]").forEach((link) => {{
+        link.href = sources[link.dataset.link](symbol);
+      }});
+    }}
+
+    document.getElementById("applySymbol").addEventListener("click", applySymbol);
+    input.addEventListener("keydown", (event) => {{
+      if (event.key === "Enter") applySymbol();
+    }});
+    document.querySelectorAll("[data-symbol]").forEach((button) => {{
+      button.addEventListener("click", () => {{
+        input.value = button.dataset.symbol;
+        applySymbol();
+      }});
+    }});
+    document.getElementById("openAll").addEventListener("click", () => {{
+      applySymbol();
+      ["tradingview", "investing", "stockplus", "naver", "reports"].forEach((key, index) => {{
+        window.setTimeout(() => window.open(sources[key](currentSymbol()), "_blank", "noopener"), index * 100);
+      }});
+    }});
+    applySymbol();
+  </script>
 </body>
 </html>
 """
-    (PUBLIC_DAILY_DIR / "index.html").write_text(html_text, encoding="utf-8")
+    (PUBLIC_ANALYSIS_DIR / "index.html").write_text(html_text, encoding="utf-8")
+    write_daily_redirect()
 
 
 def ensure_portfolio_example() -> None:
@@ -616,7 +759,7 @@ def main() -> None:
         min_market_cap_usd=min_market_cap_usd,
         portfolio=portfolio,
     )
-    print(f"daily briefing: {PUBLIC_DAILY_DIR / 'index.html'}")
+    print(f"analysis briefing: {PUBLIC_ANALYSIS_DIR / 'index.html'}")
     print(f"report: {report_path.name}")
 
 

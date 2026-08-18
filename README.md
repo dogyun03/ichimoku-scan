@@ -43,9 +43,10 @@ PC가 꺼져도 1시간마다 보려면 이 저장소를 GitHub에 올리고, Gi
 `.github/workflows/ichimoku-scan.yml`이 매시간 `public/index.html`을 새로 만들어
 GitHub Pages URL로 배포합니다.
 
-## 차트 제외 데일리 브리핑
+## 종목 분석 창
 
-차트 분석 없이 실적 날짜, 기업 주요 통계, 핵심 뉴스, 평단가, 수급/리포트 링크만 한 화면에서 보려면:
+이치모쿠 스캔 화면과 분리해서 TradingView, Investing.com, 증권플러스,
+네이버증권, 리포트 검색을 따로 열어보려면:
 
 ```powershell
 python scripts/build_daily_briefing.py --count 50
@@ -53,11 +54,12 @@ python scripts/build_daily_briefing.py --count 50
 
 생성물:
 
-- `public/daily/index.html`: GitHub Pages에서 보는 데일리 브리핑 화면
+- `public/analysis/index.html`: GitHub Pages에서 보는 종목 분석 화면
+- `public/daily/index.html`: 기존 링크 호환용 리다이렉트
 - `outputs/daily_market_briefing_*.md`: 같은 내용을 정리한 markdown 리포트
 
 평단가와 보유 수량은 개인 정보라 git에 올리지 않습니다. `portfolio.example.csv`를 참고해서
-루트 폴더에 `portfolio.csv`를 만들면 데일리 브리핑의 평단가 영역이 자동 계산됩니다.
+루트 폴더에 `portfolio.csv`를 만들면 종목 분석 창의 평단가 영역이 자동 계산됩니다.
 
 현재 데일리 브리핑은 Yahoo Finance 기반으로 실적/통계/뉴스를 자동 수집하고,
 Investing.com, 네이버증권, 증권플러스, 리포트 검색으로 바로 가는 링크를 함께 보여줍니다.
