@@ -43,7 +43,13 @@ PC가 꺼져도 1시간마다 보려면 이 저장소를 GitHub에 올리고, Gi
 `.github/workflows/ichimoku-scan.yml`이 매시간 `public/index.html`을 새로 만들어
 GitHub Pages URL로 배포합니다.
 
-## 종목 분석 창
+## 통합 대시보드와 종목 분석 창
+
+GitHub Pages의 루트 화면에서 이치모쿠 스캔과 종목 분석 탭을 함께 봅니다.
+
+- `public/index.html`: 이치모쿠 스캔과 종목 분석을 함께 보는 통합 화면
+- `public/analysis/index.html`: 종목 분석 탭에 들어가는 독립 화면
+- `public/daily/index.html`: 기존 링크 호환용 리다이렉트
 
 이치모쿠 스캔 화면과 분리해서 TradingView, Investing.com, 증권플러스,
 네이버증권, 리포트 검색을 따로 열어보려면:
@@ -52,11 +58,9 @@ GitHub Pages URL로 배포합니다.
 python scripts/build_daily_briefing.py --count 50
 ```
 
-생성물:
+분석 리포트 생성물:
 
-- `public/analysis/index.html`: GitHub Pages에서 보는 종목 분석 화면
-- `public/daily/index.html`: 기존 링크 호환용 리다이렉트
-- `outputs/daily_market_briefing_*.md`: 같은 내용을 정리한 markdown 리포트
+- `outputs/daily_market_briefing_*.md`: 종목 분석 내용을 정리한 markdown 리포트
 
 평단가와 보유 수량은 개인 정보라 git에 올리지 않습니다. `portfolio.example.csv`를 참고해서
 루트 폴더에 `portfolio.csv`를 만들면 종목 분석 창의 평단가 영역이 자동 계산됩니다.

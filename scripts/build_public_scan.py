@@ -205,6 +205,37 @@ def build_page(regular: ScanRun, prepost: ScanRun, regular_links: dict[str, str]
       font-weight: 700;
       text-decoration: none;
     }}
+    button {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 9px 12px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .dashboard-tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }}
+    .tab-button.active {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #ffffff;
+    }}
+    .view.hidden {{
+      display: none;
+    }}
+    .analysis-frame {{
+      width: 100%;
+      height: min(1100px, 82vh);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -244,19 +275,52 @@ def build_page(regular: ScanRun, prepost: ScanRun, regular_links: dict[str, str]
 <body>
   <main>
     <header>
-      <h1>거래량 상위 50 이치모쿠 스캔</h1>
+      <h1>주식 학습 대시보드</h1>
       <p>업데이트: {e(now)} / 주식은 시가총액 2조 원 이상, 일반 ETF 포함, 레버리지·인버스 ETF 제외</p>
-      <p><a href="analysis/index.html" target="_blank" rel="noopener">종목 분석 창 열기</a></p>
-      <p>학습용 보조지표 스캔이며 매수·매도 지시가 아닙니다. 프리/애프터 포함 신호는 휩쏘 가능성이 더 큽니다.</p>
+      <p>이 주소 하나에서 이치모쿠 스캔과 종목 분석을 함께 봅니다. 학습용 화면이며 매수·매도 지시가 아닙니다.</p>
+      <div class="dashboard-tabs" aria-label="화면 선택">
+        <button type="button" class="tab-button active" data-view="ichimoku">이치모쿠 스캔</button>
+        <button type="button" class="tab-button" data-view="analysis">종목 분석</button>
+      </div>
     </header>
-    <div class="note">
-      주식 시총 필터: KRW {MARKET_CAP_KRW_THRESHOLD:,.0f}+ / 정규장 환산 USD {regular.min_market_cap_usd:,.0f}+.
-      ETF는 SOXX 같은 일반 ETF를 포함하고, 2x·3x·Bull·Bear·Inverse 계열은 제외합니다.
-    </div>
-    <div class="scroll">{diff_summary(regular, prepost)}</div>
-    <div class="scroll">{run_summary(regular, 'regular', regular_links)}</div>
-    <div class="scroll">{run_summary(prepost, 'prepost', prepost_links)}</div>
+    <section id="view-ichimoku" class="view">
+      <div class="note">
+        주식 시총 필터: KRW {MARKET_CAP_KRW_THRESHOLD:,.0f}+ / 정규장 환산 USD {regular.min_market_cap_usd:,.0f}+.
+        ETF는 SOXX 같은 일반 ETF를 포함하고, 2x·3x·Bull·Bear·Inverse 계열은 제외합니다.
+        프리/애프터 포함 신호는 휩쏘 가능성이 더 큽니다.
+      </div>
+      <div class="scroll">{diff_summary(regular, prepost)}</div>
+      <div class="scroll">{run_summary(regular, 'regular', regular_links)}</div>
+      <div class="scroll">{run_summary(prepost, 'prepost', prepost_links)}</div>
+    </section>
+    <section id="view-analysis" class="view hidden">
+      <div class="note">
+        종목 분석 탭에는 TradingView, Investing.com, 증권플러스, 네이버증권, 리포트 검색 화면이 들어갑니다.
+        아래 화면에서 종목코드를 바꾸고 5개 출처를 바로 열 수 있습니다.
+      </div>
+      <iframe class="analysis-frame" src="analysis/index.html" title="종목 분석"></iframe>
+    </section>
   </main>
+  <script>
+    const buttons = document.querySelectorAll("[data-view]");
+    const views = {{
+      ichimoku: document.getElementById("view-ichimoku"),
+      analysis: document.getElementById("view-analysis"),
+    }};
+
+    function showView(name) {{
+      Object.entries(views).forEach(([key, view]) => {{
+        view.classList.toggle("hidden", key !== name);
+      }});
+      buttons.forEach((button) => {{
+        button.classList.toggle("active", button.dataset.view === name);
+      }});
+    }}
+
+    buttons.forEach((button) => {{
+      button.addEventListener("click", () => showView(button.dataset.view));
+    }});
+  </script>
 </body>
 </html>
 """
