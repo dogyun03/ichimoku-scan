@@ -3,6 +3,7 @@ __pycache__/
 data/cache/
 outputs/
 public/
+portfolio.csv
 ichimoku-training-site/node_modules/
 *.mp4
 *.pyc

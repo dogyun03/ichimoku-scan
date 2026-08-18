@@ -246,6 +246,7 @@ def build_page(regular: ScanRun, prepost: ScanRun, regular_links: dict[str, str]
     <header>
       <h1>거래량 상위 50 이치모쿠 스캔</h1>
       <p>업데이트: {e(now)} / 주식은 시가총액 2조 원 이상, 일반 ETF 포함, 레버리지·인버스 ETF 제외</p>
+      <p><a href="daily/index.html">차트 제외 데일리 브리핑</a></p>
       <p>학습용 보조지표 스캔이며 매수·매도 지시가 아닙니다. 프리/애프터 포함 신호는 휩쏘 가능성이 더 큽니다.</p>
     </header>
     <div class="note">

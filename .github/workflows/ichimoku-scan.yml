@@ -35,8 +35,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build scan page
-        run: python scripts/build_public_scan.py
+      - name: Build scan pages
+        run: |
+          python scripts/build_public_scan.py
+          python scripts/build_daily_briefing.py
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
