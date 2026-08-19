@@ -545,6 +545,72 @@ def news_summary(symbol: str, title: str) -> str:
     return f"{symbol}의 개별 재료가 기존 추세를 강화하는지 확인할 뉴스입니다."
 
 
+def news_sentiment(title: str) -> tuple[str, str, str]:
+    text = title.lower()
+    positive = (
+        "beat",
+        "beats",
+        "surge",
+        "jumps",
+        "jump",
+        "rises",
+        "rise",
+        "gain",
+        "gains",
+        "upgrade",
+        "raises",
+        "raised",
+        "record",
+        "growth",
+        "bullish",
+        "outperform",
+        "buy",
+        "strong",
+        "profit",
+        "upside",
+        "confidence",
+        "optimism",
+        "undervalued",
+    )
+    negative = (
+        "miss",
+        "misses",
+        "falls",
+        "fall",
+        "drops",
+        "drop",
+        "sinks",
+        "sink",
+        "plunge",
+        "downgrade",
+        "cuts",
+        "cut",
+        "lowers",
+        "lowered",
+        "loss",
+        "lawsuit",
+        "probe",
+        "ban",
+        "weak",
+        "bearish",
+        "underperform",
+        "sell",
+        "risk",
+        "overvalued",
+        "below fair value",
+        "dilution",
+        "retreat",
+        "concern",
+        "slump",
+        "decline",
+    )
+    if any(word in text for word in negative):
+        return ("악재", "bad", "가격 부담, 목표가 하향, 실적 부진, 규제/소송성 표현이 포함됐습니다.")
+    if any(word in text for word in positive):
+        return ("호재", "good", "실적 호조, 목표가 상향, 성장, 강세 표현이 포함됐습니다.")
+    return ("중립", "neutral", "방향성이 뚜렷하지 않아 추세와 거래량 반응을 같이 확인합니다.")
+
+
 def korean_news_title(symbol: str, title: str) -> str:
     theme = news_theme(title)
     text = title.lower()
@@ -565,6 +631,14 @@ def korean_news_title(symbol: str, title: str) -> str:
     if "stock" in text and ("fall" in text or "drop" in text or "sink" in text):
         return f"{symbol} 주가 약세 관련 뉴스"
     return f"{symbol} {theme} 핵심 뉴스"
+
+
+def sentiment_class(label: object) -> str:
+    if label == "호재":
+        return "good"
+    if label == "악재":
+        return "bad"
+    return "neutral"
 
 
 def news_angle(title: str) -> str:
@@ -600,6 +674,7 @@ def fetch_news(symbol: str, limit: int) -> list[dict[str, object]]:
         published = item.findtext("pubDate") or ""
         published_dt = parse_news_datetime(published)
         if title:
+            sentiment, sentiment_css, sentiment_reason = news_sentiment(title)
             items.append(
                 {
                     "symbol": symbol,
@@ -609,6 +684,9 @@ def fetch_news(symbol: str, limit: int) -> list[dict[str, object]]:
                     "published_dt": published_dt,
                     "theme": news_theme(title),
                     "ko_title": korean_news_title(symbol, title),
+                    "sentiment": sentiment,
+                    "sentiment_css": sentiment_css,
+                    "sentiment_reason": sentiment_reason,
                     "summary": news_summary(symbol, title),
                     "angle": news_angle(title),
                 }
@@ -920,6 +998,127 @@ def stats_rows(records: list[dict[str, object]]) -> str:
     return "".join(rows)
 
 
+def info_item(label: str, value: object) -> str:
+    return f"<div class=\"info-item\"><span>{e(label)}</span><b>{e(value)}</b></div>"
+
+
+def stock_news_items(record: dict[str, object]) -> str:
+    news = list(record.get("news") or [])
+    if not news:
+        return '<div class="empty-line">자동 수집된 관련 뉴스가 없습니다. 뉴스 링크에서 직접 확인하세요.</div>'
+
+    items: list[str] = []
+    for item in news:
+        sentiment = item.get("sentiment", "중립")
+        items.append(
+            f'<article class="news-card {sentiment_class(sentiment)}">'
+            '<div class="news-card-head">'
+            f'<span class="pill {sentiment_class(sentiment)}">{e(sentiment)}</span>'
+            f'<span>{e(item.get("theme", "기업 이슈"))}</span>'
+            f'<span>{fmt_datetime(item.get("published_dt"))}</span>'
+            "</div>"
+            f'<a href="{e(item.get("link", ""))}" target="_blank" rel="noopener">{e(item.get("ko_title", ""))}</a>'
+            f"<p>{e(item.get('summary', ''))}</p>"
+            f"<p>{e(item.get('sentiment_reason', ''))}</p>"
+            f"<p>{e(item.get('angle', ''))}</p>"
+            f'<small>원문: {e(item.get("title", ""))}</small>'
+            "</article>"
+        )
+    return "".join(items)
+
+
+def stock_foreign_report_items(record: dict[str, object]) -> str:
+    extras = dict(record.get("extras") or {})
+    reports = list(extras.get("foreign_reports") or [])[:2]
+    if not reports:
+        return '<div class="empty-line">자동 수집된 해외 애널리스트 업데이트가 없습니다.</div>'
+
+    items: list[str] = []
+    for report in reports:
+        items.append(
+            '<div class="report-line">'
+            f'<b>{e(report.get("firm", ""))}</b>'
+            f'<span>{e(report.get("action_ko", ""))}</span>'
+            f'<span>{e(report.get("grade_change", ""))}</span>'
+            f'<span>{e(report.get("target_change", ""))}</span>'
+            f'<a href="{e(report.get("link", ""))}" target="_blank" rel="noopener">확인</a>'
+            "</div>"
+        )
+    return "".join(items)
+
+
+def stock_info_cards(records: list[dict[str, object]]) -> str:
+    cards: list[str] = []
+    for rank, record in enumerate(records_by_earnings(records), start=1):
+        symbol = str(record["symbol"])
+        name = clean_text(record.get("name") or record.get("long_name") or symbol)
+        extras = dict(record.get("extras") or {})
+        links = dict(record.get("links") or source_links(symbol))
+        next_earnings = extras.get("next_earnings")
+        change_pct = fmt_pct(record.get("change_pct"))
+        change_class = "good" if change_pct.startswith("+") else "bad" if change_pct.startswith("-") else "neutral"
+        news = list(record.get("news") or [])
+        good_count = sum(1 for item in news if item.get("sentiment") == "호재")
+        bad_count = sum(1 for item in news if item.get("sentiment") == "악재")
+        neutral_count = sum(1 for item in news if item.get("sentiment") not in {"호재", "악재"})
+
+        metric_html = "".join(
+            [
+                info_item("구분", record.get("asset_class", record.get("quote_type", "n/a"))),
+                info_item("현재가", fmt_price(record.get("price"))),
+                info_item("등락률", change_pct),
+                info_item("거래량", fmt_number(record.get("volume"))),
+                info_item("시가총액", market_cap_text(record.get("market_cap"))),
+                info_item("다음 실적", fmt_date(next_earnings)),
+                info_item("D-Day", earnings_d_day(next_earnings)),
+                info_item("최근 분기", fmt_date(extras.get("latest_quarter"))),
+                info_item("최근 매출", fmt_money(extras.get("latest_revenue"))),
+                info_item("순이익", fmt_money(extras.get("latest_net_income"))),
+                info_item("EPS", fmt_ratio(extras.get("latest_eps"))),
+                info_item("매출 성장률", fmt_fin_pct(extras.get("revenue_growth"))),
+                info_item("이익률", fmt_fin_pct(extras.get("profit_margin"))),
+                info_item("PER T/F", f"{fmt_ratio(extras.get('trailing_pe'))}/{fmt_ratio(extras.get('forward_pe'))}"),
+                info_item("52주 위치", extras.get("position_52w", "n/a")),
+                info_item("섹터", extras.get("sector", "n/a")),
+                info_item("산업", extras.get("industry", "n/a")),
+                info_item("평균 목표가", fmt_price(extras.get("target_mean_price"))),
+                info_item("추천", extras.get("recommendation", "n/a")),
+                info_item("해외 목표가 범위", extras.get("analyst_price_target_summary", "n/a") or "n/a"),
+                info_item("해외 투자의견 분포", extras.get("analyst_recommendation_mix", "n/a") or "n/a"),
+            ]
+        )
+
+        cards.append(
+            '<article class="stock-card">'
+            '<div class="stock-head">'
+            '<div>'
+            f'<div class="rank-line">#{rank} 실적발표 순서</div>'
+            f"<h3>{e(symbol)} <span>{e(name)}</span></h3>"
+            "</div>"
+            '<div class="stock-badges">'
+            f'<span class="pill neutral">{e(earnings_d_day(next_earnings))}</span>'
+            f'<span class="pill {change_class}">{e(change_pct)}</span>'
+            f'<span class="pill good">호재 {good_count}</span>'
+            f'<span class="pill bad">악재 {bad_count}</span>'
+            f'<span class="pill neutral">중립 {neutral_count}</span>'
+            "</div>"
+            "</div>"
+            f'<div class="info-grid">{metric_html}</div>'
+            '<div class="quick-links">'
+            f'<a href="{e(links["investing"])}" target="_blank" rel="noopener">실적</a>'
+            f'<a href="{e(links["yahoo_stats"])}" target="_blank" rel="noopener">통계</a>'
+            f'<a href="{e(links["stockplus"])}" target="_blank" rel="noopener">뉴스</a>'
+            f'<a href="{e(links["reports"])}" target="_blank" rel="noopener">리포트</a>'
+            "</div>"
+            '<h4>관련 뉴스 분류</h4>'
+            f'<div class="news-card-list">{stock_news_items(record)}</div>'
+            '<h4>해외 애널리스트 업데이트</h4>'
+            f'<div class="report-line-list">{stock_foreign_report_items(record)}</div>'
+            "</article>"
+        )
+    return "".join(cards)
+
+
 def collect_news(records: list[dict[str, object]], limit: int = 24) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     for record in records:
@@ -943,19 +1142,22 @@ def collect_foreign_reports(records: list[dict[str, object]], limit: int = 24) -
 def news_rows(records: list[dict[str, object]]) -> str:
     rows: list[str] = []
     for item in collect_news(records):
+        sentiment = item.get("sentiment", "중립")
         rows.append(
             "<tr>"
             f"<td>{e(item.get('symbol', ''))}</td>"
+            f'<td><span class="pill {sentiment_class(sentiment)}">{e(sentiment)}</span></td>'
             f"<td>{e(item.get('theme', '기업 이슈'))}</td>"
             f'<td><a href="{e(item.get("link", ""))}">{e(item.get("ko_title", ""))}</a></td>'
             f"<td>{e(item.get('summary', ''))}</td>"
+            f"<td>{e(item.get('sentiment_reason', ''))}</td>"
             f"<td>{e(item.get('angle', ''))}</td>"
             f"<td>{e(item.get('title', ''))}</td>"
             f"<td>{fmt_datetime(item.get('published_dt'))}</td>"
             "</tr>"
         )
     if not rows:
-        return '<tr><td colspan="7">자동 수집된 핵심 뉴스가 없습니다. 종목별 뉴스 링크에서 직접 확인하세요.</td></tr>'
+        return '<tr><td colspan="9">자동 수집된 핵심 뉴스가 없습니다. 종목별 뉴스 링크에서 직접 확인하세요.</td></tr>'
     return "".join(rows)
 
 
@@ -1090,14 +1292,16 @@ def write_markdown(
             "",
             "## Daily key news",
             "",
-            "| Symbol | Theme | Korean Brief | Summary | Checkpoint | Original | Published |",
-            "|---|---|---|---|---|---|---|",
+            "| Symbol | Sentiment | Theme | Korean Brief | Summary | Reason | Checkpoint | Original | Published |",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
     )
     for item in collect_news(records, limit=24):
         lines.append(
-            f"| {item.get('symbol', '')} | {item.get('theme', '')} | [{item.get('ko_title', '')}]({item.get('link', '')}) | "
-            f"{item.get('summary', '')} | {item.get('angle', '')} | {item.get('title', '')} | {fmt_datetime(item.get('published_dt'))} |"
+            f"| {item.get('symbol', '')} | {item.get('sentiment', '중립')} | {item.get('theme', '')} | "
+            f"[{item.get('ko_title', '')}]({item.get('link', '')}) | {item.get('summary', '')} | "
+            f"{item.get('sentiment_reason', '')} | {item.get('angle', '')} | {item.get('title', '')} | "
+            f"{fmt_datetime(item.get('published_dt'))} |"
         )
 
     lines.extend(
@@ -1352,6 +1556,165 @@ def write_html(
       gap: 8px;
       margin-bottom: 8px;
     }}
+    .pill {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 12px;
+      font-weight: 800;
+      color: var(--text);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      white-space: nowrap;
+    }}
+    .pill.good {{
+      color: #047857;
+      border-color: #8fd8b5;
+      background: #e9f8ef;
+    }}
+    .pill.bad {{
+      color: #b42318;
+      border-color: #f1a9a0;
+      background: #fff0ee;
+    }}
+    .pill.neutral {{
+      color: #475569;
+      border-color: #cbd5e1;
+      background: #f8fafc;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      .pill.good {{
+        color: #86efac;
+        border-color: #166534;
+        background: #102317;
+      }}
+      .pill.bad {{
+        color: #fca5a5;
+        border-color: #7f1d1d;
+        background: #2a1212;
+      }}
+      .pill.neutral {{
+        color: #cbd5e1;
+        border-color: #475569;
+        background: #1e293b;
+      }}
+    }}
+    .stock-list {{
+      display: grid;
+      gap: 14px;
+    }}
+    .stock-card {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 16px;
+    }}
+    .stock-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }}
+    .rank-line {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 4px;
+    }}
+    .stock-card h3 {{
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0;
+    }}
+    .stock-card h3 span {{
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 500;
+    }}
+    .stock-card h4 {{
+      margin: 14px 0 8px;
+      font-size: 14px;
+      letter-spacing: 0;
+    }}
+    .stock-badges,
+    .quick-links,
+    .news-card-head,
+    .report-line {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }}
+    .info-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 8px 12px;
+      margin: 10px 0;
+    }}
+    .info-item {{
+      min-width: 0;
+      border-top: 1px solid var(--line);
+      padding-top: 7px;
+    }}
+    .info-item span {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }}
+    .info-item b {{
+      display: block;
+      margin-top: 2px;
+      font-size: 14px;
+      word-break: break-word;
+    }}
+    .quick-links {{
+      margin-top: 12px;
+    }}
+    .quick-links a {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 10px;
+      background: var(--bg);
+    }}
+    .news-card-list {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+    }}
+    .news-card {{
+      min-width: 0;
+      border-left: 4px solid var(--line);
+      padding: 10px 0 10px 12px;
+    }}
+    .news-card.good {{
+      border-left-color: #10b981;
+    }}
+    .news-card.bad {{
+      border-left-color: #ef4444;
+    }}
+    .news-card.neutral {{
+      border-left-color: #94a3b8;
+    }}
+    .news-card p {{
+      margin: 5px 0;
+    }}
+    .news-card small,
+    .empty-line {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .report-line-list {{
+      display: grid;
+      gap: 6px;
+    }}
+    .report-line {{
+      color: var(--muted);
+      font-size: 13px;
+    }}
     .section-tabs {{
       position: sticky;
       top: 0;
@@ -1452,17 +1815,8 @@ def write_html(
     <section id="section-stats" class="data-section">
       <h2>실적 날짜·결과·기업 주요 통계</h2>
       <p>정렬 기준: 다가오는 실적발표일이 가장 빠른 순입니다. 날짜가 없거나 이미 지난 날짜만 확인되는 종목은 아래쪽에 둡니다.</p>
-      <div class="scroll">
-        <table>
-          <thead>
-            <tr>
-              <th>Symbol</th><th>Type</th><th>Price</th><th>Chg</th><th>Volume</th><th>Market Cap</th>
-              <th>Next Earnings</th><th>D-Day</th><th>Latest Q</th><th>Revenue</th><th>Net Income</th><th>EPS</th>
-              <th>Revenue Growth</th><th>Margin</th><th>PE T/F</th><th>52w Pos</th><th>Links</th>
-            </tr>
-          </thead>
-          <tbody>{stats_rows(records)}</tbody>
-        </table>
+      <div class="stock-list">
+        {stock_info_cards(records)}
       </div>
     </section>
 
@@ -1470,7 +1824,7 @@ def write_html(
       <h2>오늘 핵심뉴스</h2>
       <div class="scroll">
         <table>
-          <thead><tr><th>Symbol</th><th>Theme</th><th>한국어 브리핑</th><th>요약</th><th>확인 포인트</th><th>원문 제목</th><th>Published</th></tr></thead>
+          <thead><tr><th>Symbol</th><th>호재/악재</th><th>Theme</th><th>한국어 브리핑</th><th>요약</th><th>분류 근거</th><th>확인 포인트</th><th>원문 제목</th><th>Published</th></tr></thead>
           <tbody>{news_rows(records)}</tbody>
         </table>
       </div>
@@ -1663,7 +2017,7 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=50)
     parser.add_argument("--screen-count", type=int, default=DEFAULT_SCREEN_COUNT)
     parser.add_argument("--enrich-limit", type=int, default=50)
-    parser.add_argument("--news-limit", type=int, default=25)
+    parser.add_argument("--news-limit", type=int, default=50)
     parser.add_argument("--report-limit", type=int, default=36)
     parser.add_argument("--foreign-symbol-limit", type=int, default=14)
     parser.add_argument("--foreign-report-per-symbol", type=int, default=2)
