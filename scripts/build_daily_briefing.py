@@ -133,6 +133,68 @@ def fmt_date(value: object) -> str:
     return clean_text(value) or "n/a"
 
 
+def parse_earnings_date(value: object) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        dates = [parsed for item in value if (parsed := parse_earnings_date(item)) is not None]
+        if not dates:
+            return None
+        today = datetime.now(KST).date()
+        future_dates = [item for item in dates if item >= today]
+        return min(future_dates or dates)
+    if hasattr(value, "to_pydatetime"):
+        return parse_earnings_date(value.to_pydatetime())
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=KST)
+        return value.astimezone(KST).date()
+    if isinstance(value, date):
+        return value
+
+    text = clean_text(value)
+    if not text or text.lower() in {"n/a", "none", "nan", "nat"}:
+        return None
+
+    for pattern, year_prefix in ((r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", ""), (r"(\d{2})[.](\d{1,2})[.](\d{1,2})", "20")):
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            year = int(f"{year_prefix}{match.group(1)}")
+            return date(year, int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def earnings_d_day(value: object) -> str:
+    earnings_date = parse_earnings_date(value)
+    if earnings_date is None:
+        return "n/a"
+    delta = (earnings_date - datetime.now(KST).date()).days
+    if delta == 0:
+        return "D-Day"
+    if delta > 0:
+        return f"D-{delta}"
+    return f"D+{abs(delta)}"
+
+
+def earnings_sort_key(record: dict[str, object]) -> tuple[int, date, float]:
+    extras = dict(record.get("extras") or {})
+    earnings_date = parse_earnings_date(extras.get("next_earnings"))
+    volume = number_or_none(record.get("volume")) or 0
+    if earnings_date is None:
+        return (2, date.max, -volume)
+    if earnings_date < datetime.now(KST).date():
+        return (1, earnings_date, -volume)
+    return (0, earnings_date, -volume)
+
+
+def records_by_earnings(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    return sorted(records, key=earnings_sort_key)
+
+
 def fmt_datetime(value: object) -> str:
     if value is None:
         return "n/a"
@@ -829,7 +891,7 @@ def portfolio_rows(records: list[dict[str, object]], portfolio: dict[str, Portfo
 
 def stats_rows(records: list[dict[str, object]]) -> str:
     rows: list[str] = []
-    for record in records:
+    for record in records_by_earnings(records):
         symbol = str(record["symbol"])
         extras = dict(record.get("extras") or {})
         links = dict(record.get("links") or source_links(symbol))
@@ -842,6 +904,7 @@ def stats_rows(records: list[dict[str, object]]) -> str:
             f"<td>{fmt_number(record.get('volume'))}</td>"
             f"<td>{market_cap_text(record.get('market_cap'))}</td>"
             f"<td>{fmt_date(extras.get('next_earnings'))}</td>"
+            f"<td>{earnings_d_day(extras.get('next_earnings'))}</td>"
             f"<td>{fmt_date(extras.get('latest_quarter'))}</td>"
             f"<td>{fmt_money(extras.get('latest_revenue'))}</td>"
             f"<td>{fmt_money(extras.get('latest_net_income'))}</td>"
@@ -977,6 +1040,7 @@ def write_markdown(
         f"- Filtered universe analyzed: `{len(records)}`",
         f"- Equity market cap filter: KRW `{MARKET_CAP_KRW_THRESHOLD:,.0f}`+ ~= USD `{min_market_cap_usd:,.0f}`+ at USD/KRW `{usd_krw:,.2f}`",
         "- ETF rule: normal ETFs included; leveraged/inverse ETFs excluded",
+        "- Earnings table sort: upcoming earnings date ascending; missing dates at the bottom",
         f"- Excluded summary: `{excluded}`",
         "",
         "## Average price lookup",
@@ -1003,17 +1067,18 @@ def write_markdown(
             "",
             "## Earnings dates, results, and key stats",
             "",
-            "| Symbol | Type | Price | Chg | Vol | MCap | Next Earnings | Latest Q | Revenue | Net Income | EPS | Revenue Growth | Margin | PE T/F | 52w Pos |",
-            "|---|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| Symbol | Type | Price | Chg | Vol | MCap | Next Earnings | D-Day | Latest Q | Revenue | Net Income | EPS | Revenue Growth | Margin | PE T/F | 52w Pos |",
+            "|---|---|---:|---:|---:|---:|---|---:|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
-    for record in records:
+    for record in records_by_earnings(records):
         symbol = str(record["symbol"])
         extras = dict(record.get("extras") or {})
         lines.append(
             f"| {symbol} | {record.get('asset_class', record.get('quote_type', 'n/a'))} | "
             f"{fmt_price(record.get('price'))} | {fmt_pct(record.get('change_pct'))} | {fmt_number(record.get('volume'))} | "
             f"{market_cap_text(record.get('market_cap'))} | {fmt_date(extras.get('next_earnings'))} | "
+            f"{earnings_d_day(extras.get('next_earnings'))} | "
             f"{fmt_date(extras.get('latest_quarter'))} | {fmt_money(extras.get('latest_revenue'))} | "
             f"{fmt_money(extras.get('latest_net_income'))} | {fmt_ratio(extras.get('latest_eps'))} | "
             f"{fmt_fin_pct(extras.get('revenue_growth'))} | {fmt_fin_pct(extras.get('profit_margin'))} | "
@@ -1386,12 +1451,13 @@ def write_html(
 
     <section id="section-stats" class="data-section">
       <h2>실적 날짜·결과·기업 주요 통계</h2>
+      <p>정렬 기준: 다가오는 실적발표일이 가장 빠른 순입니다. 날짜가 없거나 이미 지난 날짜만 확인되는 종목은 아래쪽에 둡니다.</p>
       <div class="scroll">
         <table>
           <thead>
             <tr>
               <th>Symbol</th><th>Type</th><th>Price</th><th>Chg</th><th>Volume</th><th>Market Cap</th>
-              <th>Next Earnings</th><th>Latest Q</th><th>Revenue</th><th>Net Income</th><th>EPS</th>
+              <th>Next Earnings</th><th>D-Day</th><th>Latest Q</th><th>Revenue</th><th>Net Income</th><th>EPS</th>
               <th>Revenue Growth</th><th>Margin</th><th>PE T/F</th><th>52w Pos</th><th>Links</th>
             </tr>
           </thead>
@@ -1596,7 +1662,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build a chart-free daily market briefing page.")
     parser.add_argument("--count", type=int, default=50)
     parser.add_argument("--screen-count", type=int, default=DEFAULT_SCREEN_COUNT)
-    parser.add_argument("--enrich-limit", type=int, default=25)
+    parser.add_argument("--enrich-limit", type=int, default=50)
     parser.add_argument("--news-limit", type=int, default=25)
     parser.add_argument("--report-limit", type=int, default=36)
     parser.add_argument("--foreign-symbol-limit", type=int, default=14)
