@@ -371,6 +371,25 @@ def foreign_report_analysis(report: dict[str, str]) -> str:
     return "해외 톤은 유지·점검 성격입니다. 기존 추세를 바꿀 정도의 변화인지 확인합니다."
 
 
+def analyst_change_profile(report: dict[str, str]) -> tuple[str, str, str]:
+    action = report.get("action_ko", "")
+    grade = f"{report.get('to_grade', '')} {report.get('from_grade', '')}".lower()
+    target = report.get("target_change", "")
+    if "하향" in action:
+        return ("하향 변화", "bad", "목표가 또는 투자의견 하향이 감지됐습니다.")
+    if "상향" in action:
+        return ("상향 변화", "good", "목표가 또는 투자의견 상향이 감지됐습니다.")
+    if "제시" in action or "신규" in action:
+        return ("신규/제시", "neutral", "새 커버리지나 목표가 제시라 기존 추세 변화와 비교가 필요합니다.")
+    if any(word in grade for word in ("buy", "outperform", "overweight", "strong buy")):
+        return ("우호 의견", "good", "최신 투자의견에 매수·초과수익 계열 표현이 포함됐습니다.")
+    if any(word in grade for word in ("sell", "underperform", "underweight")):
+        return ("부담 의견", "bad", "최신 투자의견에 매도·부진 계열 표현이 포함됐습니다.")
+    if target:
+        return ("목표가 확인", "neutral", "목표가 변화는 있으나 방향성이 명확하지 않습니다.")
+    return ("유지/점검", "neutral", "뚜렷한 상향·하향 변화보다 유지성 업데이트에 가깝습니다.")
+
+
 def fetch_foreign_analyst_bundle(symbol: str, ticker: yf.Ticker, limit: int) -> dict[str, object]:
     bundle: dict[str, object] = {"reports": [], "price_targets": "", "recommendation_mix": ""}
     if limit <= 0:
@@ -422,6 +441,10 @@ def fetch_foreign_analyst_bundle(symbol: str, ticker: yf.Ticker, limit: int) -> 
             "recommendation_mix": str(bundle.get("recommendation_mix") or ""),
             "link": source_links(symbol)["yahoo_analysis"],
         }
+        change_signal, change_css, change_reason = analyst_change_profile(report)
+        report["change_signal"] = change_signal
+        report["change_css"] = change_css
+        report["change_reason"] = change_reason
         report["summary"] = foreign_report_summary(symbol, report)
         report["analysis"] = foreign_report_analysis(report)
         reports.append(report)
@@ -611,6 +634,51 @@ def news_sentiment(title: str) -> tuple[str, str, str]:
     return ("중립", "neutral", "방향성이 뚜렷하지 않아 추세와 거래량 반응을 같이 확인합니다.")
 
 
+def news_impact_profile(title: str) -> dict[str, object]:
+    text = title.lower()
+    score = 20
+    drivers: list[str] = []
+
+    def bump(words: tuple[str, ...], points: int, label: str) -> None:
+        nonlocal score
+        if any(word in text for word in words):
+            score += points
+            drivers.append(label)
+
+    bump(("earnings", "guidance", "revenue", "profit", "sales", "eps"), 22, "실적/가이던스")
+    bump(("beat", "beats", "miss", "misses", "above estimates", "below estimates"), 18, "컨센서스 차이")
+    bump(("upgrade", "downgrade", "rating", "price target", "target price"), 20, "애널리스트 변화")
+    bump(("raises", "raised", "lowers", "lowered", "cuts", "cut"), 12, "목표가·전망 수정")
+    bump(("surge", "jumps", "jump", "plunge", "drops", "drop", "sinks", "falls", "slump"), 16, "주가 급변")
+    bump(("lawsuit", "probe", "regulator", "tariff", "ban", "investigation"), 18, "규제/소송 리스크")
+    bump(("ai", "chip", "semiconductor", "data center", "gpu", "bitcoin", "crypto"), 10, "테마 민감도")
+
+    score = max(0, min(score, 100))
+    if score >= 70:
+        return {
+            "score": score,
+            "level": "강",
+            "css": "impact-high",
+            "drivers": ", ".join(dict.fromkeys(drivers)) or "복합 재료",
+            "note": "당일 변동성과 거래량 확대 가능성을 우선 확인합니다.",
+        }
+    if score >= 45:
+        return {
+            "score": score,
+            "level": "중",
+            "css": "impact-medium",
+            "drivers": ", ".join(dict.fromkeys(drivers)) or "개별 뉴스",
+            "note": "섹터 동반 반응과 장중 유지력을 같이 봅니다.",
+        }
+    return {
+        "score": score,
+        "level": "약",
+        "css": "impact-low",
+        "drivers": ", ".join(dict.fromkeys(drivers)) or "방향성 약함",
+        "note": "단독 매매 근거보다 보조 확인 자료로 봅니다.",
+    }
+
+
 def korean_news_title(symbol: str, title: str) -> str:
     theme = news_theme(title)
     text = title.lower()
@@ -675,6 +743,7 @@ def fetch_news(symbol: str, limit: int) -> list[dict[str, object]]:
         published_dt = parse_news_datetime(published)
         if title:
             sentiment, sentiment_css, sentiment_reason = news_sentiment(title)
+            impact = news_impact_profile(title)
             items.append(
                 {
                     "symbol": symbol,
@@ -687,6 +756,11 @@ def fetch_news(symbol: str, limit: int) -> list[dict[str, object]]:
                     "sentiment": sentiment,
                     "sentiment_css": sentiment_css,
                     "sentiment_reason": sentiment_reason,
+                    "impact_score": impact["score"],
+                    "impact_level": impact["level"],
+                    "impact_css": impact["css"],
+                    "impact_drivers": impact["drivers"],
+                    "impact_note": impact["note"],
                     "summary": news_summary(symbol, title),
                     "angle": news_angle(title),
                 }
@@ -998,6 +1072,249 @@ def stats_rows(records: list[dict[str, object]]) -> str:
     return "".join(rows)
 
 
+def symbol_anchor(symbol: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "-", symbol.upper()).strip("-")
+    return f"stock-{safe or 'symbol'}"
+
+
+def news_impact_number(item: dict[str, object]) -> int:
+    number = number_or_none(item.get("impact_score"))
+    return int(number or 0)
+
+
+def record_news_counts(record: dict[str, object]) -> dict[str, int]:
+    news = list(record.get("news") or [])
+    return {
+        "good": sum(1 for item in news if item.get("sentiment") == "호재"),
+        "bad": sum(1 for item in news if item.get("sentiment") == "악재"),
+        "neutral": sum(1 for item in news if item.get("sentiment") not in {"호재", "악재"}),
+    }
+
+
+def record_news_profile(record: dict[str, object]) -> dict[str, object]:
+    news = list(record.get("news") or [])
+    if not news:
+        return {
+            "score": 0,
+            "level": "없음",
+            "css": "neutral",
+            "summary": "관련 뉴스 없음",
+            "drivers": "n/a",
+        }
+    top = max(news, key=news_impact_number)
+    return {
+        "score": news_impact_number(top),
+        "level": top.get("impact_level", "약"),
+        "css": top.get("impact_css", "impact-low"),
+        "summary": f"{top.get('sentiment', '중립')} {top.get('impact_level', '약')} {news_impact_number(top)}점",
+        "drivers": top.get("impact_drivers", "n/a"),
+    }
+
+
+def analyst_signal_counts(record: dict[str, object]) -> dict[str, object]:
+    extras = dict(record.get("extras") or {})
+    reports = list(extras.get("foreign_reports") or [])
+    up = sum(1 for report in reports if report.get("change_css") == "good")
+    down = sum(1 for report in reports if report.get("change_css") == "bad")
+    neutral = max(0, len(reports) - up - down)
+    if up > down:
+        return {
+            "label": "상향 우세",
+            "css": "good",
+            "summary": f"상향 {up} / 하향 {down} / 중립 {neutral}",
+            "weight": up - down,
+        }
+    if down > up:
+        return {
+            "label": "하향 우세",
+            "css": "bad",
+            "summary": f"상향 {up} / 하향 {down} / 중립 {neutral}",
+            "weight": down - up,
+        }
+    if reports:
+        return {
+            "label": "변화 혼재",
+            "css": "neutral",
+            "summary": f"상향 {up} / 하향 {down} / 중립 {neutral}",
+            "weight": 0,
+        }
+    return {
+        "label": "변화 없음",
+        "css": "neutral",
+        "summary": "수집된 최신 변화 없음",
+        "weight": 0,
+    }
+
+
+def record_priority_score(record: dict[str, object]) -> int:
+    score = int(record_news_profile(record)["score"])
+    analyst = analyst_signal_counts(record)
+    score += int(analyst.get("weight") or 0) * 12
+    extras = dict(record.get("extras") or {})
+    earnings_date = parse_earnings_date(extras.get("next_earnings"))
+    if earnings_date is not None:
+        days = (earnings_date - datetime.now(KST).date()).days
+        if 0 <= days <= 3:
+            score += 30
+        elif 0 <= days <= 7:
+            score += 22
+        elif 0 <= days <= 14:
+            score += 12
+    return score
+
+
+def focus_item(title: str, body: str, css: str = "neutral") -> str:
+    return (
+        '<div class="focus-item">'
+        f'<span class="pill {e(css)}">{e(title)}</span>'
+        f"<p>{body}</p>"
+        "</div>"
+    )
+
+
+def daily_focus_panel(records: list[dict[str, object]]) -> str:
+    today = datetime.now(KST).date()
+    upcoming: list[str] = []
+    for record in records_by_earnings(records):
+        extras = dict(record.get("extras") or {})
+        earnings_date = parse_earnings_date(extras.get("next_earnings"))
+        if earnings_date is None or earnings_date < today:
+            continue
+        symbol = str(record["symbol"])
+        upcoming.append(f'<a href="#{symbol_anchor(symbol)}">{e(symbol)}</a> {e(earnings_d_day(earnings_date))}')
+        if len(upcoming) >= 5:
+            break
+
+    news_items = collect_news(records, limit=200)
+    good_news = sorted(
+        [item for item in news_items if item.get("sentiment") == "호재"],
+        key=news_impact_number,
+        reverse=True,
+    )[:3]
+    bad_news = sorted(
+        [item for item in news_items if item.get("sentiment") == "악재"],
+        key=news_impact_number,
+        reverse=True,
+    )[:3]
+
+    def news_line(items: list[dict[str, object]]) -> str:
+        if not items:
+            return "강한 방향성 뉴스가 아직 없습니다."
+        parts = []
+        for item in items:
+            symbol = str(item.get("symbol", ""))
+            parts.append(
+                f'<a href="#{symbol_anchor(symbol)}">{e(symbol)}</a> '
+                f'{news_impact_number(item)}점 {e(item.get("ko_title", ""))}'
+            )
+        return " / ".join(parts)
+
+    analyst_records = []
+    for record in records:
+        profile = analyst_signal_counts(record)
+        if profile["label"] != "변화 없음":
+            analyst_records.append((record, profile))
+    analyst_records.sort(key=lambda pair: int(pair[1].get("weight") or 0), reverse=True)
+    analyst_line = "수집된 해외 애널리스트 변화가 아직 없습니다."
+    if analyst_records:
+        analyst_line = " / ".join(
+            f'<a href="#{symbol_anchor(str(record["symbol"]))}">{e(record["symbol"])}</a> '
+            f'{e(profile["label"])}({e(profile["summary"])})'
+            for record, profile in analyst_records[:3]
+        )
+
+    priority = sorted(records, key=record_priority_score, reverse=True)[:5]
+    priority_line = "점검 우선 종목이 아직 뚜렷하지 않습니다."
+    if priority:
+        priority_line = " / ".join(
+            f'<a href="#{symbol_anchor(str(record["symbol"]))}">{e(record["symbol"])}</a> {record_priority_score(record)}점'
+            for record in priority
+        )
+
+    return (
+        '<section class="focus-panel" aria-label="오늘 핵심 요약">'
+        '<div class="focus-header">'
+        "<h2>오늘 핵심 요약</h2>"
+        "<span>실적 순서, 뉴스 영향도, 애널리스트 변화를 합쳐 먼저 볼 후보를 압축합니다.</span>"
+        "</div>"
+        '<div class="focus-grid">'
+        f'{focus_item("실적 임박", " / ".join(upcoming) if upcoming else "다가오는 실적 일정이 확인된 종목이 없습니다.")}'
+        f'{focus_item("강한 호재 뉴스", news_line(good_news), "good")}'
+        f'{focus_item("강한 악재 뉴스", news_line(bad_news), "bad")}'
+        f'{focus_item("애널리스트 변화", analyst_line)}'
+        f'{focus_item("오늘 우선 점검", priority_line, "impact-medium")}'
+        "</div>"
+        "</section>"
+    )
+
+
+def markdown_focus_lines(records: list[dict[str, object]]) -> list[str]:
+    today = datetime.now(KST).date()
+    upcoming: list[str] = []
+    for record in records_by_earnings(records):
+        extras = dict(record.get("extras") or {})
+        earnings_date = parse_earnings_date(extras.get("next_earnings"))
+        if earnings_date is None or earnings_date < today:
+            continue
+        upcoming.append(f"{record['symbol']} {earnings_d_day(earnings_date)}")
+        if len(upcoming) >= 5:
+            break
+
+    news_items = collect_news(records, limit=200)
+    good_news = sorted(
+        [item for item in news_items if item.get("sentiment") == "호재"],
+        key=news_impact_number,
+        reverse=True,
+    )[:3]
+    bad_news = sorted(
+        [item for item in news_items if item.get("sentiment") == "악재"],
+        key=news_impact_number,
+        reverse=True,
+    )[:3]
+
+    analyst_records = []
+    for record in records:
+        profile = analyst_signal_counts(record)
+        if profile["label"] != "변화 없음":
+            analyst_records.append((record, profile))
+    analyst_records.sort(key=lambda pair: int(pair[1].get("weight") or 0), reverse=True)
+
+    priority = sorted(records, key=record_priority_score, reverse=True)[:5]
+    return [
+        f"- Earnings soon: {', '.join(upcoming) if upcoming else 'n/a'}",
+        "- Strong positive news: "
+        + (
+            ", ".join(f"{item.get('symbol', '')} {news_impact_number(item)}pt" for item in good_news)
+            if good_news
+            else "n/a"
+        ),
+        "- Strong negative news: "
+        + (
+            ", ".join(f"{item.get('symbol', '')} {news_impact_number(item)}pt" for item in bad_news)
+            if bad_news
+            else "n/a"
+        ),
+        "- Analyst changes: "
+        + (
+            ", ".join(
+                f"{record['symbol']} {profile['label']}({profile['summary']})"
+                for record, profile in analyst_records[:3]
+            )
+            if analyst_records
+            else "n/a"
+        ),
+        "- Review first: " + ", ".join(f"{record['symbol']} {record_priority_score(record)}pt" for record in priority),
+    ]
+
+
+def stock_jump_links(records: list[dict[str, object]]) -> str:
+    links = [
+        f'<a href="#{symbol_anchor(str(record["symbol"]))}">{e(record["symbol"])}</a>'
+        for record in records_by_earnings(records)
+    ]
+    return f'<div class="jump-row">{"".join(links)}</div>'
+
+
 def info_item(label: str, value: object) -> str:
     return f"<div class=\"info-item\"><span>{e(label)}</span><b>{e(value)}</b></div>"
 
@@ -1014,12 +1331,14 @@ def stock_news_items(record: dict[str, object]) -> str:
             f'<article class="news-card {sentiment_class(sentiment)}">'
             '<div class="news-card-head">'
             f'<span class="pill {sentiment_class(sentiment)}">{e(sentiment)}</span>'
+            f'<span class="pill {e(item.get("impact_css", "impact-low"))}">영향도 {e(item.get("impact_level", "약"))} {news_impact_number(item)}점</span>'
             f'<span>{e(item.get("theme", "기업 이슈"))}</span>'
             f'<span>{fmt_datetime(item.get("published_dt"))}</span>'
             "</div>"
             f'<a href="{e(item.get("link", ""))}" target="_blank" rel="noopener">{e(item.get("ko_title", ""))}</a>'
             f"<p>{e(item.get('summary', ''))}</p>"
             f"<p>{e(item.get('sentiment_reason', ''))}</p>"
+            f"<p>영향 요인: {e(item.get('impact_drivers', 'n/a'))}. {e(item.get('impact_note', ''))}</p>"
             f"<p>{e(item.get('angle', ''))}</p>"
             f'<small>원문: {e(item.get("title", ""))}</small>'
             "</article>"
@@ -1037,6 +1356,7 @@ def stock_foreign_report_items(record: dict[str, object]) -> str:
     for report in reports:
         items.append(
             '<div class="report-line">'
+            f'<span class="pill {e(report.get("change_css", "neutral"))}">{e(report.get("change_signal", "변화 확인"))}</span>'
             f'<b>{e(report.get("firm", ""))}</b>'
             f'<span>{e(report.get("action_ko", ""))}</span>'
             f'<span>{e(report.get("grade_change", ""))}</span>'
@@ -1045,6 +1365,36 @@ def stock_foreign_report_items(record: dict[str, object]) -> str:
             "</div>"
         )
     return "".join(items)
+
+
+def memo_box(symbol: str) -> str:
+    fields = [
+        ("view", "관점", "롱/숏/관망과 이유"),
+        ("entry", "진입 조건", "예: 구름 상단 돌파 후 지지"),
+        ("stop", "손절 라인", "가격 또는 무효화 조건"),
+        ("target", "익절 후보", "목표가, 저항대, 손익비"),
+        ("review", "결과/복기", "진입 후 실제 결과와 배운 점"),
+    ]
+    controls = []
+    for field, label, placeholder in fields:
+        controls.append(
+            '<label class="memo-field">'
+            f"<span>{e(label)}</span>"
+            f'<textarea rows="2" data-memo-symbol="{e(symbol)}" data-memo-field="{e(field)}" '
+            f'placeholder="{e(placeholder)}"></textarea>'
+            "</label>"
+        )
+    return (
+        '<details class="memo-box">'
+        "<summary>매매 시나리오 메모</summary>"
+        '<p>메모는 이 브라우저에만 저장됩니다. 공개 페이지에는 올라가지 않습니다.</p>'
+        f'<div class="memo-grid">{"".join(controls)}</div>'
+        '<div class="memo-actions">'
+        f'<span data-memo-status="{e(symbol)}">자동 저장 대기</span>'
+        f'<button type="button" data-clear-memo="{e(symbol)}">메모 비우기</button>'
+        "</div>"
+        "</details>"
+    )
 
 
 def stock_info_cards(records: list[dict[str, object]]) -> str:
@@ -1057,10 +1407,9 @@ def stock_info_cards(records: list[dict[str, object]]) -> str:
         next_earnings = extras.get("next_earnings")
         change_pct = fmt_pct(record.get("change_pct"))
         change_class = "good" if change_pct.startswith("+") else "bad" if change_pct.startswith("-") else "neutral"
-        news = list(record.get("news") or [])
-        good_count = sum(1 for item in news if item.get("sentiment") == "호재")
-        bad_count = sum(1 for item in news if item.get("sentiment") == "악재")
-        neutral_count = sum(1 for item in news if item.get("sentiment") not in {"호재", "악재"})
+        news_counts = record_news_counts(record)
+        news_profile = record_news_profile(record)
+        analyst_profile = analyst_signal_counts(record)
 
         metric_html = "".join(
             [
@@ -1085,11 +1434,14 @@ def stock_info_cards(records: list[dict[str, object]]) -> str:
                 info_item("추천", extras.get("recommendation", "n/a")),
                 info_item("해외 목표가 범위", extras.get("analyst_price_target_summary", "n/a") or "n/a"),
                 info_item("해외 투자의견 분포", extras.get("analyst_recommendation_mix", "n/a") or "n/a"),
+                info_item("뉴스 영향도", news_profile["summary"]),
+                info_item("영향 요인", news_profile["drivers"]),
+                info_item("애널리스트 변화", analyst_profile["summary"]),
             ]
         )
 
         cards.append(
-            '<article class="stock-card">'
+            f'<article class="stock-card" id="{symbol_anchor(symbol)}">'
             '<div class="stock-head">'
             '<div>'
             f'<div class="rank-line">#{rank} 실적발표 순서</div>'
@@ -1098,9 +1450,11 @@ def stock_info_cards(records: list[dict[str, object]]) -> str:
             '<div class="stock-badges">'
             f'<span class="pill neutral">{e(earnings_d_day(next_earnings))}</span>'
             f'<span class="pill {change_class}">{e(change_pct)}</span>'
-            f'<span class="pill good">호재 {good_count}</span>'
-            f'<span class="pill bad">악재 {bad_count}</span>'
-            f'<span class="pill neutral">중립 {neutral_count}</span>'
+            f'<span class="pill good">호재 {news_counts["good"]}</span>'
+            f'<span class="pill bad">악재 {news_counts["bad"]}</span>'
+            f'<span class="pill neutral">중립 {news_counts["neutral"]}</span>'
+            f'<span class="pill {e(news_profile["css"])}">뉴스영향 {e(news_profile["level"])} {e(news_profile["score"])}점</span>'
+            f'<span class="pill {e(analyst_profile["css"])}">애널리스트 {e(analyst_profile["label"])}</span>'
             "</div>"
             "</div>"
             f'<div class="info-grid">{metric_html}</div>'
@@ -1114,6 +1468,7 @@ def stock_info_cards(records: list[dict[str, object]]) -> str:
             f'<div class="news-card-list">{stock_news_items(record)}</div>'
             '<h4>해외 애널리스트 업데이트</h4>'
             f'<div class="report-line-list">{stock_foreign_report_items(record)}</div>'
+            f"{memo_box(symbol)}"
             "</article>"
         )
     return "".join(cards)
@@ -1147,17 +1502,19 @@ def news_rows(records: list[dict[str, object]]) -> str:
             "<tr>"
             f"<td>{e(item.get('symbol', ''))}</td>"
             f'<td><span class="pill {sentiment_class(sentiment)}">{e(sentiment)}</span></td>'
+            f'<td><span class="pill {e(item.get("impact_css", "impact-low"))}">영향도 {e(item.get("impact_level", "약"))} {news_impact_number(item)}점</span><br><small>{e(item.get("impact_drivers", "n/a"))}</small></td>'
             f"<td>{e(item.get('theme', '기업 이슈'))}</td>"
             f'<td><a href="{e(item.get("link", ""))}">{e(item.get("ko_title", ""))}</a></td>'
             f"<td>{e(item.get('summary', ''))}</td>"
             f"<td>{e(item.get('sentiment_reason', ''))}</td>"
+            f"<td>{e(item.get('impact_note', ''))}</td>"
             f"<td>{e(item.get('angle', ''))}</td>"
             f"<td>{e(item.get('title', ''))}</td>"
             f"<td>{fmt_datetime(item.get('published_dt'))}</td>"
             "</tr>"
         )
     if not rows:
-        return '<tr><td colspan="9">자동 수집된 핵심 뉴스가 없습니다. 종목별 뉴스 링크에서 직접 확인하세요.</td></tr>'
+        return '<tr><td colspan="11">자동 수집된 핵심 뉴스가 없습니다. 종목별 뉴스 링크에서 직접 확인하세요.</td></tr>'
     return "".join(rows)
 
 
@@ -1195,6 +1552,7 @@ def foreign_report_rows(reports: list[dict[str, str]]) -> str:
             f"<td>{e(report.get('symbol', ''))}</td>"
             f"<td>{e(report.get('date', ''))}</td>"
             f"<td>{e(report.get('firm', ''))}</td>"
+            f'<td><span class="pill {e(report.get("change_css", "neutral"))}">{e(report.get("change_signal", ""))}</span><br><small>{e(report.get("change_reason", ""))}</small></td>'
             f"<td>{e(report.get('action_ko', ''))}</td>"
             f"<td>{e(report.get('grade_change', ''))}</td>"
             f"<td>{e(report.get('target_change', ''))}</td>"
@@ -1206,7 +1564,7 @@ def foreign_report_rows(reports: list[dict[str, str]]) -> str:
             "</tr>"
         )
     if not rows:
-        return '<tr><td colspan="11">자동 수집된 해외 애널리스트 업데이트가 없습니다.</td></tr>'
+        return '<tr><td colspan="12">자동 수집된 해외 애널리스트 업데이트가 없습니다.</td></tr>'
     return "".join(rows)
 
 
@@ -1244,6 +1602,10 @@ def write_markdown(
         "- ETF rule: normal ETFs included; leveraged/inverse ETFs excluded",
         "- Earnings table sort: upcoming earnings date ascending; missing dates at the bottom",
         f"- Excluded summary: `{excluded}`",
+        "",
+        "## Today's focus",
+        "",
+        *markdown_focus_lines(records),
         "",
         "## Average price lookup",
         "",
@@ -1292,16 +1654,17 @@ def write_markdown(
             "",
             "## Daily key news",
             "",
-            "| Symbol | Sentiment | Theme | Korean Brief | Summary | Reason | Checkpoint | Original | Published |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| Symbol | Sentiment | Impact | Driver | Theme | Korean Brief | Summary | Reason | Impact Note | Checkpoint | Original | Published |",
+            "|---|---|---:|---|---|---|---|---|---|---|---|---|",
         ]
     )
     for item in collect_news(records, limit=24):
         lines.append(
-            f"| {item.get('symbol', '')} | {item.get('sentiment', '중립')} | {item.get('theme', '')} | "
+            f"| {item.get('symbol', '')} | {item.get('sentiment', '중립')} | {news_impact_number(item)} | "
+            f"{item.get('impact_drivers', '')} | {item.get('theme', '')} | "
             f"[{item.get('ko_title', '')}]({item.get('link', '')}) | {item.get('summary', '')} | "
-            f"{item.get('sentiment_reason', '')} | {item.get('angle', '')} | {item.get('title', '')} | "
-            f"{fmt_datetime(item.get('published_dt'))} |"
+            f"{item.get('sentiment_reason', '')} | {item.get('impact_note', '')} | {item.get('angle', '')} | "
+            f"{item.get('title', '')} | {fmt_datetime(item.get('published_dt'))} |"
         )
 
     lines.extend(
@@ -1309,14 +1672,15 @@ def write_markdown(
             "",
             "## Overseas analyst updates",
             "",
-            "| Symbol | Date | Firm | Action | Grade | Target | Consensus Target | Rating Mix | Summary | Analysis |",
-            "|---|---|---|---|---|---|---|---|---|---|",
+            "| Symbol | Date | Firm | Change | Reason | Action | Grade | Target | Consensus Target | Rating Mix | Summary | Analysis |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|",
         ]
     )
     for report in collect_foreign_reports(records, limit=24):
         lines.append(
             f"| {report.get('symbol', '')} | {report.get('date', '')} | {report.get('firm', '')} | "
-            f"{report.get('action_ko', '')} | {report.get('grade_change', '')} | {report.get('target_change', '')} | "
+            f"{report.get('change_signal', '')} | {report.get('change_reason', '')} | {report.get('action_ko', '')} | "
+            f"{report.get('grade_change', '')} | {report.get('target_change', '')} | "
             f"{report.get('price_targets', '')} | {report.get('recommendation_mix', '')} | "
             f"{report.get('summary', '')} | {report.get('analysis', '')} |"
         )
@@ -1464,6 +1828,17 @@ def write_html(
       font: inherit;
       text-transform: uppercase;
     }}
+    textarea {{
+      width: 100%;
+      min-height: 72px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 9px 10px;
+      font: inherit;
+      resize: vertical;
+    }}
     .note {{
       padding: 12px 14px;
       border: 1px solid var(--line);
@@ -1490,6 +1865,45 @@ def write_html(
       font-size: 20px;
       margin-top: 4px;
       word-break: break-word;
+    }}
+    .focus-panel {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 14px;
+      margin: 16px 0 18px;
+    }}
+    .focus-header {{
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: baseline;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 10px;
+      margin-bottom: 10px;
+    }}
+    .focus-header h2 {{
+      margin: 0;
+    }}
+    .focus-header span {{
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .focus-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 10px;
+    }}
+    .focus-item {{
+      min-width: 0;
+      border-left: 3px solid var(--line);
+      padding: 4px 0 4px 10px;
+    }}
+    .focus-item p {{
+      margin: 6px 0 0;
+      color: var(--text);
+      font-size: 13px;
+      word-break: keep-all;
     }}
     .toolbar {{
       display: flex;
@@ -1584,6 +1998,21 @@ def write_html(
       border-color: #cbd5e1;
       background: #f8fafc;
     }}
+    .pill.impact-high {{
+      color: #7c2d12;
+      border-color: #facc15;
+      background: #fef9c3;
+    }}
+    .pill.impact-medium {{
+      color: #1d4ed8;
+      border-color: #93c5fd;
+      background: #eff6ff;
+    }}
+    .pill.impact-low {{
+      color: #475569;
+      border-color: #cbd5e1;
+      background: #f8fafc;
+    }}
     @media (prefers-color-scheme: dark) {{
       .pill.good {{
         color: #86efac;
@@ -1600,10 +2029,46 @@ def write_html(
         border-color: #475569;
         background: #1e293b;
       }}
+      .pill.impact-high {{
+        color: #fde68a;
+        border-color: #854d0e;
+        background: #281b05;
+      }}
+      .pill.impact-medium {{
+        color: #bfdbfe;
+        border-color: #1d4ed8;
+        background: #0b1d3a;
+      }}
+      .pill.impact-low {{
+        color: #cbd5e1;
+        border-color: #475569;
+        background: #1e293b;
+      }}
     }}
     .stock-list {{
       display: grid;
       gap: 14px;
+    }}
+    .jump-row {{
+      position: sticky;
+      top: 58px;
+      z-index: 4;
+      display: flex;
+      gap: 7px;
+      overflow-x: auto;
+      padding: 8px 0;
+      margin: 8px 0 12px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--line);
+    }}
+    .jump-row a {{
+      flex: 0 0 auto;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      padding: 5px 9px;
+      color: var(--text);
+      font-size: 12px;
     }}
     .stock-card {{
       border: 1px solid var(--line);
@@ -1715,6 +2180,38 @@ def write_html(
       color: var(--muted);
       font-size: 13px;
     }}
+    .memo-box {{
+      margin-top: 14px;
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }}
+    .memo-box summary {{
+      cursor: pointer;
+      font-weight: 800;
+    }}
+    .memo-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .memo-field span {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      margin-bottom: 4px;
+    }}
+    .memo-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
     .section-tabs {{
       position: sticky;
       top: 0;
@@ -1804,6 +2301,8 @@ def write_html(
       리포트 요약은 공개 목록과 제목·메타데이터 기준의 학습용 요약이며, 원문 판단은 링크에서 확인합니다.
     </div>
 
+    {daily_focus_panel(records)}
+
     <nav class="section-tabs" aria-label="분석 자료 선택">
       <button type="button" class="section-tab active" data-section="stats">실적/통계</button>
       <button type="button" class="section-tab" data-section="news">핵심뉴스</button>
@@ -1815,6 +2314,7 @@ def write_html(
     <section id="section-stats" class="data-section">
       <h2>실적 날짜·결과·기업 주요 통계</h2>
       <p>정렬 기준: 다가오는 실적발표일이 가장 빠른 순입니다. 날짜가 없거나 이미 지난 날짜만 확인되는 종목은 아래쪽에 둡니다.</p>
+      {stock_jump_links(records)}
       <div class="stock-list">
         {stock_info_cards(records)}
       </div>
@@ -1824,7 +2324,7 @@ def write_html(
       <h2>오늘 핵심뉴스</h2>
       <div class="scroll">
         <table>
-          <thead><tr><th>Symbol</th><th>호재/악재</th><th>Theme</th><th>한국어 브리핑</th><th>요약</th><th>분류 근거</th><th>확인 포인트</th><th>원문 제목</th><th>Published</th></tr></thead>
+          <thead><tr><th>Symbol</th><th>호재/악재</th><th>영향도</th><th>Theme</th><th>한국어 브리핑</th><th>요약</th><th>분류 근거</th><th>영향 메모</th><th>확인 포인트</th><th>원문 제목</th><th>Published</th></tr></thead>
           <tbody>{news_rows(records)}</tbody>
         </table>
       </div>
@@ -1882,7 +2382,7 @@ def write_html(
         <table>
           <thead>
             <tr>
-              <th>Symbol</th><th>Date</th><th>Firm</th><th>Action</th><th>Grade</th><th>Target</th>
+              <th>Symbol</th><th>Date</th><th>Firm</th><th>변화 감지</th><th>Action</th><th>Grade</th><th>Target</th>
               <th>Consensus Target</th><th>Rating Mix</th><th>요약</th><th>분석</th><th>Link</th>
             </tr>
           </thead>
@@ -1953,6 +2453,59 @@ def write_html(
       document.getElementById("portfolioLookup").innerHTML = rowsFromObject(portfolio);
     }}
 
+    const memoPrefix = "ichimoku-analysis-memo:v1:";
+    function memoKey(symbol, field) {{
+      return `${{memoPrefix}}${{symbol}}:${{field}}`;
+    }}
+
+    function memoStorageAvailable() {{
+      try {{
+        const testKey = `${{memoPrefix}}test`;
+        localStorage.setItem(testKey, "1");
+        localStorage.removeItem(testKey);
+        return true;
+      }} catch (error) {{
+        return false;
+      }}
+    }}
+
+    function updateMemoStatus(symbol, message) {{
+      const status = document.querySelector(`[data-memo-status="${{symbol}}"]`);
+      if (status) status.textContent = message;
+    }}
+
+    function initMemos() {{
+      const canStore = memoStorageAvailable();
+      document.querySelectorAll("[data-memo-symbol]").forEach((field) => {{
+        const symbol = field.dataset.memoSymbol;
+        const memoField = field.dataset.memoField;
+        if (!symbol || !memoField) return;
+        if (canStore) {{
+          field.value = localStorage.getItem(memoKey(symbol, memoField)) || "";
+        }} else {{
+          field.placeholder = "이 브라우저에서는 자동 저장을 사용할 수 없습니다.";
+        }}
+        field.addEventListener("input", () => {{
+          if (!canStore) return;
+          localStorage.setItem(memoKey(symbol, memoField), field.value);
+          const savedAt = new Date().toLocaleTimeString("ko-KR", {{ hour: "2-digit", minute: "2-digit" }});
+          updateMemoStatus(symbol, `저장됨 ${{savedAt}}`);
+        }});
+      }});
+
+      document.querySelectorAll("[data-clear-memo]").forEach((button) => {{
+        button.addEventListener("click", () => {{
+          const symbol = button.dataset.clearMemo;
+          if (!symbol || !canStore) return;
+          document.querySelectorAll(`[data-memo-symbol="${{symbol}}"]`).forEach((field) => {{
+            localStorage.removeItem(memoKey(symbol, field.dataset.memoField));
+            field.value = "";
+          }});
+          updateMemoStatus(symbol, "메모를 비웠습니다");
+        }});
+      }});
+    }}
+
     const sectionButtons = document.querySelectorAll("[data-section]");
     const sections = {{
       stats: document.getElementById("section-stats"),
@@ -1992,6 +2545,7 @@ def write_html(
       }});
     }});
     applySymbol();
+    initMemos();
   </script>
 </body>
 </html>
